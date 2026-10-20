@@ -1,0 +1,761 @@
+From 15b7981b1bd9c0a6ebb753baa3a035d691ad3531 Mon Sep 17 00:00:00 2001
+From: sofianbll <174883520+sofianbll@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:54:37 +0200
+Subject: [PATCH 1/3] feat(core): load local Agent Plugins packages through
+ transforms
+
+---
+ packages/core/src/config/plugin/source.ts     |  32 ++-
+ packages/core/src/plugin/agent-package.ts     | 210 ++++++++++++++++++
+ packages/core/src/plugin/module.ts            |  23 +-
+ .../core/test/config/plugin-source.test.ts    |  51 +++++
+ .../core/test/fixture/agent-plugin/README.md  |  37 +++
+ .../core/test/fixture/agent-plugin/mcp.json   |  12 +
+ .../test/fixture/agent-plugin/plugin.json     |   5 +
+ .../skills/portable-greet/SKILL.md            |   6 +
+ packages/core/test/plugin/module.test.ts      | 105 ++++++++-
+ .../test/plugin/supervisor-reload.test.ts     | 144 ++++++++++++
+ 10 files changed, 612 insertions(+), 13 deletions(-)
+ create mode 100644 packages/core/src/plugin/agent-package.ts
+ create mode 100644 packages/core/test/config/plugin-source.test.ts
+ create mode 100644 packages/core/test/fixture/agent-plugin/README.md
+ create mode 100644 packages/core/test/fixture/agent-plugin/mcp.json
+ create mode 100644 packages/core/test/fixture/agent-plugin/plugin.json
+ create mode 100644 packages/core/test/fixture/agent-plugin/skills/portable-greet/SKILL.md
+
+diff --git a/packages/core/src/config/plugin/source.ts b/packages/core/src/config/plugin/source.ts
+index ef1057a..6d18182 100644
+--- a/packages/core/src/config/plugin/source.ts
++++ b/packages/core/src/config/plugin/source.ts
+@@ -161,22 +161,32 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
+       if (operation.type === "remove" || !path.isAbsolute(operation.target)) return [operation]
+       if (!(yield* fs.existsSafe(operation.target))) return [operation]
+       const directory = yield* fs.isDir(operation.target)
+-      const entrypoints: Host.Entrypoints = directory
+-        ? yield* Effect.sync(() => Host.resolve({ directory: operation.target }))
+-        : { server: pathToFileURL(operation.target).href }
+-      if (!entrypoints.server) return []
+-      if (directory) {
++      const portable =
++        directory &&
++        (yield* fs.readDirectoryEntries(operation.target).pipe(Effect.orElseSucceed(() => []))).some(
++          (entry) => entry.name === "plugin.json",
++        )
++      const entrypoints: Host.Entrypoints = portable
++        ? {}
++        : directory
++          ? yield* Effect.sync(() => Host.resolve({ directory: operation.target }))
++          : { server: pathToFileURL(operation.target).href }
++      if (!entrypoints.server && !portable) return []
++      if (directory && entrypoints.server) {
+         const root = yield* fs.resolve(operation.target)
+         const server = yield* fs.resolve(fileURLToPath(entrypoints.server))
+         if (!FSUtil.contains(root, server)) return []
+       }
++      // Portable revisions include component contents; only the loader may resolve their contained paths.
+       const times = yield* Effect.forEach(
+-        [
+-          ...Object.values(entrypoints)
+-            .filter((entry) => entry !== undefined)
+-            .map((entry) => fileURLToPath(entry)),
+-          path.join(directory ? operation.target : path.dirname(operation.target), "package.json"),
+-        ],
++        portable
++          ? [operation.target]
++          : [
++              ...Object.values(entrypoints)
++                .filter((entry) => entry !== undefined)
++                .map((entry) => fileURLToPath(entry)),
++              path.join(directory ? operation.target : path.dirname(operation.target), "package.json"),
++            ],
+         (entry) =>
+           fs.stat(entry).pipe(
+             Effect.map((info) => Option.getOrElse(info.mtime, () => new Date(0)).getTime()),
+diff --git a/packages/core/src/plugin/agent-package.ts b/packages/core/src/plugin/agent-package.ts
+new file mode 100644
+index 0000000..a80bf71
+--- /dev/null
++++ b/packages/core/src/plugin/agent-package.ts
+@@ -0,0 +1,210 @@
++export * as AgentPackage from "./agent-package.js"
++
++import { Effect, Schema } from "effect"
++import { mkdir, readdir, realpath, stat } from "node:fs/promises"
++import path from "node:path"
++import { FSUtil } from "@opencode/util/fs-util"
++import type { Generation } from "./service.js"
++import { Skill } from "@opencode/schema/skill"
++import { Mcp } from "@opencode/schema/mcp"
++import { Hash } from "@opencode/util/hash"
++import { ConfigMarkdown } from "../config/markdown.js"
++import { SkillFile } from "../config/plugin/skill-file.js"
++
++const Manifest = Schema.Struct({
++  $schema: Schema.Literal("https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"),
++  name: Schema.String.check(Schema.isPattern(/^(?!.*--)(?!.*\.\.)(?=.{1,64}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/)),
++  version: Schema.optional(Schema.String),
++  description: Schema.optional(Schema.String),
++  author: Schema.optional(
++    Schema.Struct({
++      name: Schema.optional(Schema.String),
++      email: Schema.optional(Schema.String),
++      url: Schema.optional(Schema.String),
++    }),
++  ),
++  homepage: Schema.optional(Schema.String),
++  repository: Schema.optional(Schema.String),
++  license: Schema.optional(Schema.String),
++  keywords: Schema.optional(Schema.Array(Schema.String)),
++  extensions: Schema.optional(Schema.Unknown),
++})
++
++const Stdio = Schema.Struct({
++  type: Schema.Literal("stdio"),
++  command: Schema.String,
++  args: Schema.optional(Schema.Array(Schema.String)),
++  env: Schema.optional(Schema.Record(Schema.String, Schema.String)),
++  cwd: Schema.optional(Schema.String),
++})
++const MCP = Schema.Struct({
++  $schema: Schema.Literal("https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"),
++  mcpServers: Schema.Record(Schema.String, Schema.Unknown),
++})
++const Frontmatter = Schema.Struct({
++  name: Schema.String.check(Schema.isPattern(/^(?!.*--)(?=.{1,64}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/)),
++  description: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(1024)),
++  license: Schema.optional(Schema.String),
++  compatibility: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(500))),
++  metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
++  "allowed-tools": Schema.optional(Schema.String),
++})
++
++export async function load(directory: string, data: string): Promise<Generation> {
++  const root = await realpath(directory)
++  const file = await contained(root, "plugin.json")
++  const input: unknown = await Bun.file(file).json()
++  const object = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown))(input)
++  const fields = new Set(Object.keys(Manifest.fields))
++  const unknown = Object.keys(object).filter((key) => !fields.has(key))
++  if (unknown.length) console.warn(`Agent Plugin ${file}: ignoring unknown fields: ${unknown.join(", ")}`)
++  const manifest = Schema.decodeUnknownSync(Manifest, { onExcessProperty: "error" })(
++    Object.fromEntries(Object.entries(object).filter(([key]) => fields.has(key))),
++  )
++  if (
++    manifest.extensions !== undefined &&
++    (typeof manifest.extensions !== "object" || manifest.extensions === null || Array.isArray(manifest.extensions))
++  )
++    console.warn(`Agent Plugin ${file}: ignoring non-object extensions`)
++  const skills = await readSkills(root)
++  const servers = await readMcp(root, data)
++  return {
++    id: manifest.name,
++    source: { type: "local", path: file },
++    revision: JSON.stringify([input, skills, servers]),
++    effect: (ctx) =>
++      Effect.gen(function* () {
++        yield* ctx.skill.transform((editor) => {
++          skills.forEach((skill) => {
++            if (!editor.get(skill.id)) editor.add(skill)
++          })
++        })
++        yield* ctx.mcp.transform((editor) => {
++          servers.forEach(([name, config]) => {
++            if (!editor.get(name)) editor.set(name, config)
++          })
++        })
++      }),
++  }
++}
++
++async function readSkills(root: string): Promise<Skill.Info[]> {
++  const directory = await component(root, "skills", "directory")
++  if (!directory) return []
++  const children = await readdir(directory)
++  const skills = await Promise.all(
++    children.sort().map(async (name) => {
++      const file = await component(root, `skills/${name}/SKILL.md`, "file")
++      if (!file) return []
++      try {
++        const content = await Bun.file(file).text()
++        const markdown = ConfigMarkdown.parse(content)
++        const frontmatter = Schema.decodeUnknownSync(Frontmatter)(markdown.data)
++        if (frontmatter.name !== name) throw new Error("Skill name must match its directory")
++        const parsed = SkillFile.parse(directory, file, content)
++        return parsed._tag === "Parsed" ? [parsed.skill] : []
++      } catch (error) {
++        console.warn(`Agent Plugin: skipping skill ${file}: ${String(error)}`)
++        return []
++      }
++    }),
++  )
++  return skills.flat()
++}
++
++async function readMcp(root: string, data: string): Promise<[string, Mcp.ServerConfig][]> {
++  const file = await component(root, "mcp.json", "file")
++  if (!file) return []
++  try {
++    const config = Schema.decodeUnknownSync(MCP, { onExcessProperty: "error" })(await Bun.file(file).json())
++    const servers = await Promise.all(
++      Object.entries(config.mcpServers).map(async ([name, input]) => {
++        try {
++          // Remote transports are intentionally unsupported: native remote config cannot pin a transport.
++          const server = Schema.decodeUnknownSync(Stdio, { onExcessProperty: "error" })(input)
++          if (
++            !server.command ||
++            /\0/.test(server.command) ||
++            (!server.command.startsWith("./") && /[\s/\\$]/.test(server.command))
++          )
++            throw new Error("command must be a bare executable or a ./ package path, without placeholders")
++          if (
++            Object.keys(server.env ?? {}).some((key) =>
++              ["PLUGIN_ROOT", "PLUGIN_DATA"].includes(process.platform === "win32" ? key.toUpperCase() : key),
++            )
++          )
++            throw new Error("env must not override PLUGIN_ROOT or PLUGIN_DATA")
++          const command = server.command.startsWith("./") ? await contained(root, server.command) : server.command
++          const storage = path.join(data, "agent-plugins", Hash.sha256(root))
++          await mkdir(storage, { recursive: true })
++          const pluginData = await realpath(storage)
++          const expand = (value: string) =>
++            value.replace(/\$\{PLUGIN_(ROOT|DATA)\}/g, (_, key) => (key === "ROOT" ? root : pluginData))
++          const cwd = server.cwd ?? "${PLUGIN_ROOT}"
++          const base = cwd === "${PLUGIN_DATA}" || cwd.startsWith("${PLUGIN_DATA}/") ? pluginData : root
++          if (
++            !(
++              cwd.startsWith("./") ||
++              cwd === "${PLUGIN_ROOT}" ||
++              cwd.startsWith("${PLUGIN_ROOT}/") ||
++              cwd === "${PLUGIN_DATA}" ||
++              cwd.startsWith("${PLUGIN_DATA}/")
++            )
++          )
++            throw new Error("cwd must be rooted in ./, ${PLUGIN_ROOT}, or ${PLUGIN_DATA}")
++          const working = await contained(base, expand(cwd), true)
++          return [
++            [
++              name,
++              Mcp.LocalConfig.make({
++                type: "local",
++                command: [command, ...(server.args ?? []).map(expand)],
++                cwd: working,
++                environment: {
++                  ...Object.fromEntries(Object.entries(server.env ?? {}).map(([key, value]) => [key, expand(value)])),
++                  PLUGIN_ROOT: root,
++                  PLUGIN_DATA: pluginData,
++                },
++              }),
++            ] satisfies [string, Mcp.ServerConfig],
++          ]
++        } catch (error) {
++          console.warn(`Agent Plugin: skipping MCP server ${name}: ${String(error)}`)
++          return []
++        }
++      }),
++    )
++    return servers.flat()
++  } catch (error) {
++    console.warn(`Agent Plugin: disabling MCP ${file}: ${String(error)}`)
++    return []
++  }
++}
++
++async function component(root: string, file: string, kind: "file" | "directory") {
++  try {
++    const resolved = await contained(root, file)
++    const info = await stat(resolved)
++    if (kind === "file" ? info.isFile() : info.isDirectory()) return resolved
++    throw new Error(`Expected ${kind}`)
++  } catch (error) {
++    if (!(error instanceof Error && "code" in error && ["ENOENT", "ENOTDIR"].includes(String(error.code))))
++      console.warn(`Agent Plugin: invalid component ${file}: ${String(error)}`)
++    return undefined
++  }
++}
++
++async function contained(root: string, file: string, missing = false): Promise<string> {
++  const target = path.resolve(root, file)
++  const resolved = await realpath(target).catch(async (error: unknown): Promise<string> => {
++    if (
++      !missing ||
++      !(error instanceof Error && "code" in error && error.code === "ENOENT") ||
++      path.dirname(target) === target
++    )
++      throw error
++    return path.join(await contained(root, path.dirname(target), true), path.basename(target))
++  })
++  if (!FSUtil.contains(root, resolved)) throw new Error(`Package path escapes plugin root: ${file}`)
++  return resolved
++}
+diff --git a/packages/core/src/plugin/module.ts b/packages/core/src/plugin/module.ts
+index 6eb061d..113e02a 100644
+--- a/packages/core/src/plugin/module.ts
++++ b/packages/core/src/plugin/module.ts
+@@ -6,7 +6,7 @@ import { createPluginSources } from "@opencode/plugin/source"
+ import { Npm } from "@opencode/util/npm"
+ import { Deferred, Effect, FiberSet, PubSub, Schema, Stream } from "effect"
+ import path from "path"
+-import { stat } from "node:fs/promises"
++import { lstat, stat } from "node:fs/promises"
+ import { fileURLToPath, pathToFileURL } from "url"
+ import type { ConfigPluginSource } from "../config/plugin/source.js"
+ import type { Generation } from "../plugin.js"
+@@ -14,6 +14,8 @@ import { PluginPromise } from "./promise.js"
+ import { Config } from "../config.js"
+ import { ManagedPolicy } from "../managed-policy.js"
+ import { Watcher } from "../filesystem/watcher.js"
++import { AgentPackage } from "./agent-package.js"
++import { Global } from "@opencode/util/global"
+ 
+ export const make = Effect.fn("PluginModule.make")(function* () {
+   const config = yield* Config.Service
+@@ -101,6 +103,25 @@ const load = Effect.fn("PluginModule.load")(function* (
+   options?: { readonly install?: boolean },
+ ) {
+   const local = path.isAbsolute(operation.target)
++  const manifest =
++    local &&
++    (yield* Effect.promise(() =>
++      lstat(path.join(operation.target, "plugin.json")).then(
++        () => true,
++        (error: unknown) => {
++          if (error instanceof Error && "code" in error && ["ENOENT", "ENOTDIR"].includes(String(error.code)))
++            return false
++          throw error
++        },
++      ),
++    ))
++  if (manifest) {
++    return yield* Effect.tryPromise({
++      try: () => AgentPackage.load(operation.target, Global.Path.data),
++      catch: (cause) =>
++        new LoadError({ message: `Invalid Agent Plugin ${operation.target}/plugin.json: ${String(cause)}`, cause }),
++    })
++  }
+   const npm = yield* Npm.Service
+   const installed = local
+     ? undefined
+diff --git a/packages/core/test/config/plugin-source.test.ts b/packages/core/test/config/plugin-source.test.ts
+new file mode 100644
+index 0000000..9b84606
+--- /dev/null
++++ b/packages/core/test/config/plugin-source.test.ts
+@@ -0,0 +1,51 @@
++import { expect } from "bun:test"
++import { cp, mkdir } from "node:fs/promises"
++import path from "node:path"
++import { Effect, Layer } from "effect"
++import { Config } from "@opencode/core/config"
++import { ConfigPluginSource } from "@opencode/core/config/plugin/source"
++import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
++import { Watcher } from "@opencode/core/filesystem/watcher"
++import { Location } from "@opencode/core/location"
++import { Directory, Document, Info } from "@opencode/schema/config"
++import { AbsolutePath } from "@opencode/schema/schema"
++import { tempLocationLayer } from "../fixture/location"
++import { tmpdirScoped } from "../fixture/tmpdir"
++import { testEffect } from "../lib/effect"
++
++const config = Config.testLayer()
++const it = testEffect(
++  AppNodeBuilder.build(ConfigPluginSource.node, [
++    Config.node.replace(config),
++    Location.node.replace(tempLocationLayer),
++    Watcher.node.replace(Watcher.testLayer),
++  ]).pipe(Layer.provideMerge(config)),
++)
++
++it.live("discovers portable directories while still rejecting directories without a manifest or code entrypoint", () =>
++  Effect.gen(function* () {
++    const directory = yield* tmpdirScoped()
++    const portable = path.join(directory.path, "plugins/portable")
++    const configured = path.join(directory.path, "configured")
++    const invalid = path.join(directory.path, "plugins/invalid")
++    yield* Effect.promise(async () => {
++      await cp(path.join(import.meta.dir, "../fixture/agent-plugin"), portable, { recursive: true })
++      await cp(portable, configured, { recursive: true })
++      await mkdir(path.join(directory.path, "plugins/empty"), { recursive: true })
++      await Bun.write(path.join(invalid, "plugin.json"), "not JSON")
++      await Bun.write(path.join(directory.path, "plugins/code/index.ts"), "export default {}")
++    })
++    const config = yield* Config.Test
++    yield* config.setEntries([
++      new Directory({ type: "directory", path: AbsolutePath.make(directory.path) }),
++      new Document({ type: "document", info: new Info({ plugins: [configured] }) }),
++    ])
++    const source = yield* ConfigPluginSource.Service
++    expect((yield* source.operations()).map((operation) => operation.target)).toEqual([
++      path.join(directory.path, "plugins/code"),
++      invalid,
++      portable,
++      configured,
++    ])
++  }),
++)
+diff --git a/packages/core/test/fixture/agent-plugin/README.md b/packages/core/test/fixture/agent-plugin/README.md
+new file mode 100644
+index 0000000..31f4715
+--- /dev/null
++++ b/packages/core/test/fixture/agent-plugin/README.md
+@@ -0,0 +1,37 @@
++# Local Agent Plugins fixture
++
++This package exercises the local-only Agent Plugins 1.0.0 adapter against
++<https://agent-plugins.org/specification>. It has no code plugin entrypoint.
++The MCP command is only a configuration fixture; `server.cjs` is intentionally absent.
++
++Configure its directory in `plugins`, or place it beneath `.opencode/plugin/` or
++`.opencode/plugins/`. Root `plugin.json` takes precedence over code entrypoints;
++an invalid manifest fails loading. Unknown manifest fields are reported and ignored.
++Metadata is validated by type, not by URL, email, or semver conventions. Client
++extensions are ignored. Only immediate `skills/*/SKILL.md` children are discovered.
++
++The adapter supports stdio MCP entries in this exact portable envelope:
++
++```json
++{
++  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
++  "mcpServers": {
++    "example": { "type": "stdio", "command": "node", "args": ["example.js"] }
++  }
++}
++```
++
++Mapping to `Mcp.ServerConfig`: `stdio` becomes `local`, `command` plus `args`
++become the native `command` array, `env` becomes `environment`, and `cwd` becomes
++an absolute contained working directory (default: plugin root). `${PLUGIN_ROOT}`
++and `${PLUGIN_DATA}` expand once in args, environment values and cwd, never in
++command or environment keys. Other placeholders stay literal. Reserved environment
++variables are supplied by the host. Persistent data lives in the OpenCode data
++directory under `agent-plugins/<hash-of-resolved-plugin-root>`.
++
++Remote transports (`streamable-http` and `sse`) are skipped with a diagnostic:
++the native remote config cannot enforce their declared initial transport.
++Invalid MCP files disable MCP only; invalid server entries and skills are skipped
++individually. Package paths are checked using real paths, including symlinks;
++command arguments and environment values remain opaque rather than package paths.
++Contributions are scoped transforms, not copied configuration, and disappear on unload.
+diff --git a/packages/core/test/fixture/agent-plugin/mcp.json b/packages/core/test/fixture/agent-plugin/mcp.json
+new file mode 100644
+index 0000000..c57b74b
+--- /dev/null
++++ b/packages/core/test/fixture/agent-plugin/mcp.json
+@@ -0,0 +1,12 @@
++{
++  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
++  "mcpServers": {
++    "portable-server": {
++      "type": "stdio",
++      "command": "node",
++      "args": ["${PLUGIN_ROOT}/server.cjs", "${PLUGIN_DATA}", "${UNKNOWN}"],
++      "env": { "FIXTURE_ROOT": "${PLUGIN_ROOT}" },
++      "cwd": "${PLUGIN_ROOT}"
++    }
++  }
++}
+diff --git a/packages/core/test/fixture/agent-plugin/plugin.json b/packages/core/test/fixture/agent-plugin/plugin.json
+new file mode 100644
+index 0000000..e96fb34
+--- /dev/null
++++ b/packages/core/test/fixture/agent-plugin/plugin.json
+@@ -0,0 +1,5 @@
++{
++  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
++  "name": "portable-fixture",
++  "version": "1.0.0"
++}
+diff --git a/packages/core/test/fixture/agent-plugin/skills/portable-greet/SKILL.md b/packages/core/test/fixture/agent-plugin/skills/portable-greet/SKILL.md
+new file mode 100644
+index 0000000..d6f2636
+--- /dev/null
++++ b/packages/core/test/fixture/agent-plugin/skills/portable-greet/SKILL.md
+@@ -0,0 +1,6 @@
++---
++name: portable-greet
++description: Greet a user with a portable plugin skill.
++---
++
++Say hello from the portable plugin.
+diff --git a/packages/core/test/plugin/module.test.ts b/packages/core/test/plugin/module.test.ts
+index 63d51ac..08931f5 100644
+--- a/packages/core/test/plugin/module.test.ts
++++ b/packages/core/test/plugin/module.test.ts
+@@ -1,5 +1,5 @@
+ import { expect } from "bun:test"
+-import { cp } from "node:fs/promises"
++import { cp, mkdir, symlink } from "node:fs/promises"
+ import path from "node:path"
+ import { Brand, Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Scope, Stream } from "effect"
+ import { Agent } from "@opencode/schema/agent"
+@@ -32,6 +32,109 @@ const it = testEffect(
+   ),
+ )
+ 
++it.live("loads a local Agent Plugins package without a server entrypoint", () =>
++  Effect.gen(function* () {
++    const directory = yield* tmpdirScoped()
++    yield* Effect.promise(() =>
++      cp(path.join(import.meta.dir, "../fixture/agent-plugin"), directory.path, { recursive: true }),
++    )
++    const modules = yield* PluginModule.make()
++    expect(yield* modules.load({ type: "add", target: directory.path, options: {} })).toMatchObject({
++      id: "portable-fixture",
++      source: { type: "local", path: path.join(directory.path, "plugin.json") },
++    })
++  }),
++)
++
++for (const manifest of [
++  {},
++  { $schema: "https://agent-plugins.org/schemas/9/plugin.schema.json", name: "portable" },
++  { $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "Not-valid" },
++  { $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "portable", author: { extra: true } },
++]) {
++  it.live(`rejects an invalid Agent Plugins manifest: ${JSON.stringify(manifest)}`, () =>
++    Effect.gen(function* () {
++      const directory = yield* tmpdirScoped()
++      yield* Effect.promise(() => Bun.write(path.join(directory.path, "plugin.json"), JSON.stringify(manifest)))
++      const modules = yield* PluginModule.make()
++      expect(yield* modules.load({ type: "add", target: directory.path, options: {} }).pipe(Effect.flip)).toMatchObject(
++        { _tag: "PluginModule.LoadError", message: expect.stringContaining("Invalid Agent Plugin") },
++      )
++    }),
++  )
++}
++
++it.live("ignores unknown manifest fields and unimplemented extensions without tightening metadata formats", () =>
++  Effect.gen(function* () {
++    const directory = yield* tmpdirScoped()
++    yield* Effect.promise(() =>
++      Bun.write(
++        path.join(directory.path, "plugin.json"),
++        JSON.stringify({
++          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
++          name: "portable.metadata",
++          version: "not semver",
++          homepage: "not a URL",
++          extensions: { "example.unimplemented": "not an object" },
++          unknown: true,
++        }),
++      ),
++    )
++    const modules = yield* PluginModule.make()
++    expect(yield* modules.load({ type: "add", target: directory.path, options: {} })).toMatchObject({
++      id: "portable.metadata",
++    })
++  }),
++)
++
++it.live("applies managed policy before reading an Agent Plugins manifest", () =>
++  Effect.gen(function* () {
++    const directory = yield* tmpdirScoped()
++    yield* Effect.promise(() => Bun.write(path.join(directory.path, "plugin.json"), "not JSON"))
++    const managed = yield* ManagedPolicy.Service
++    yield* managed.set({
++      statements: [{ action: "integration.use", resource: `plugin:${directory.path}`, effect: "deny" }],
++    })
++    const modules = yield* PluginModule.make()
++    expect(yield* modules.load({ type: "add", target: directory.path, options: {} })).toEqual({ blocked: true })
++  }),
++)
++
++it.live("rejects a manifest symlink outside the plugin root", () =>
++  Effect.gen(function* () {
++    const directory = yield* tmpdirScoped()
++    const outside = path.join(directory.path, "outside.json")
++    const root = path.join(directory.path, "plugin")
++    yield* Effect.promise(async () => {
++      await mkdir(root)
++      await Bun.write(outside, await Bun.file(path.join(import.meta.dir, "../fixture/agent-plugin/plugin.json")).text())
++      await symlink(outside, path.join(root, "plugin.json"))
++      await Bun.write(
++        path.join(root, "index.ts"),
++        'throw new Error("must not execute code before manifest validation")',
++      )
++    })
++    const modules = yield* PluginModule.make()
++    expect(yield* modules.load({ type: "add", target: root, options: {} }).pipe(Effect.flip)).toMatchObject({
++      message: expect.stringContaining("escapes plugin root"),
++    })
++  }),
++)
++
++it.live("rejects a plugin.json directory before evaluating a code entrypoint", () =>
++  Effect.gen(function* () {
++    const directory = yield* tmpdirScoped()
++    yield* Effect.promise(async () => {
++      await mkdir(path.join(directory.path, "plugin.json"))
++      await Bun.write(path.join(directory.path, "index.ts"), 'export default { id: "must-not-load", async setup() {} }')
++    })
++    const modules = yield* PluginModule.make()
++    expect(yield* modules.load({ type: "add", target: directory.path, options: {} }).pipe(Effect.flip)).toMatchObject({
++      message: expect.stringContaining("Invalid Agent Plugin"),
++    })
++  }),
++)
++
+ it.live("watches creation of an external helper with missing parent directories", () =>
+   Effect.gen(function* () {
+     const directory = yield* tmpdirScoped()
+diff --git a/packages/core/test/plugin/supervisor-reload.test.ts b/packages/core/test/plugin/supervisor-reload.test.ts
+index e2ed79e..b7e973f 100644
+--- a/packages/core/test/plugin/supervisor-reload.test.ts
++++ b/packages/core/test/plugin/supervisor-reload.test.ts
+@@ -19,6 +19,8 @@ import { LocationServiceMap } from "@opencode/core/location-services"
+ import { Location } from "@opencode/core/location"
+ import { Plugin } from "@opencode/core/plugin"
+ import { Rpc } from "@opencode/core/rpc"
++import { Mcp } from "@opencode/core/mcp/index"
++import { Skill } from "@opencode/core/skill"
+ import { SdkPlugins } from "@opencode/core/plugin/sdk"
+ import { AbsolutePath } from "@opencode/core/schema"
+ import { tempGlobalLayer } from "../fixture/global"
+@@ -113,6 +115,148 @@ const failed = (plugins: Plugin.Interface) =>
+   )
+ 
+ describe("PluginSupervisor reload", () => {
++  it.live("isolates invalid portable skills and MCP servers, including symlink escapes", () =>
++    Effect.gen(function* () {
++      const directory = yield* tmpdirScoped()
++      const root = path.join(directory.path, ".opencode/plugins/portable")
++      yield* Effect.promise(async () => {
++        await fs.cp(path.join(import.meta.dir, "../fixture/agent-plugin"), root, { recursive: true })
++        await Bun.write(
++          path.join(directory.path, "outside/SKILL.md"),
++          "---\nname: escaped\ndescription: Outside\n---\nOutside",
++        )
++        await fs.symlink(path.join(directory.path, "outside"), path.join(root, "skills/escaped"))
++        await Bun.write(
++          path.join(root, "skills/nested/child/SKILL.md"),
++          "---\nname: child\ndescription: Nested\n---\nNested",
++        )
++        const mcp = await Bun.file(path.join(root, "mcp.json")).json()
++        Object.assign(mcp.mcpServers, {
++          "bundled-command": { type: "stdio", command: "./bundled tool" },
++          escape: { type: "stdio", command: "./escape" },
++          "bad-cwd": { type: "stdio", command: "node", cwd: "./../" },
++          "bad-data": { type: "stdio", command: "node", cwd: "${PLUGIN_DATA}/../" },
++          "reserved-env": { type: "stdio", command: "node", env: { PLUGIN_ROOT: "/wrong" } },
++          "unknown-field": { type: "stdio", command: "node", surprise: true },
++          remote: { type: "streamable-http", url: "https://example.com/mcp" },
++        })
++        await Bun.write(path.join(root, "bundled tool"), "fixture executable token")
++        await fs.symlink(path.join(directory.path, "outside/SKILL.md"), path.join(root, "escape"))
++        await Bun.write(path.join(root, "mcp.json"), JSON.stringify(mcp))
++      })
++      const locations = yield* LocationServiceMap.Service
++      yield* Effect.gen(function* () {
++        const plugins = yield* Plugin.Service
++        const skills = yield* Skill.Service
++        const mcp = yield* Mcp.Service
++        yield* plugins.awaitActivation
++        expect(yield* skills.get(Skill.ID.make("portable-greet"))).toBeDefined()
++        expect(yield* skills.get(Skill.ID.make("escaped"))).toBeUndefined()
++        expect(yield* skills.get(Skill.ID.make("child"))).toBeUndefined()
++        yield* (yield* mcp.transform((editor) => {
++          expect(editor.list().map(([name]) => String(name))).toEqual(["portable-server", "bundled-command"])
++          expect(structuredClone(editor.get("bundled-command"))).toMatchObject({
++            type: "local",
++            command: [path.join(root, "bundled tool")],
++          })
++        })).dispose
++      }).pipe(
++        Effect.scoped,
++        Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(directory.path) }))),
++      )
++    }),
++  )
++
++  for (const mode of ["configured", "discovered"] as const) {
++    it.live(`loads ${mode} Agent Plugins contributions and removes them on unload`, () =>
++      Effect.gen(function* () {
++        const directory = yield* tmpdirScoped()
++        const root = path.join(
++          directory.path,
++          mode === "configured" ? "external/portable" : ".opencode/plugins/portable",
++        )
++        const configFile = path.join(directory.path, ".opencode/opencode.json")
++        yield* Effect.promise(async () => {
++          await fs.cp(path.join(import.meta.dir, "../fixture/agent-plugin"), root, { recursive: true })
++          await Bun.write(configFile, JSON.stringify({ plugins: mode === "configured" ? [root] : [] }))
++        })
++        const locations = yield* LocationServiceMap.Service
++        const watcher = yield* Watcher.Test
++        yield* Effect.gen(function* () {
++          const plugins = yield* Plugin.Service
++          const skills = yield* Skill.Service
++          const mcp = yield* Mcp.Service
++          yield* plugins.awaitActivation
++          expect(yield* plugins.list()).toContainEqual(
++            expect.objectContaining({
++              id: "portable-fixture",
++              state: { status: "active" },
++            }),
++          )
++          expect(structuredClone(yield* skills.get(Skill.ID.make("portable-greet")))).toMatchObject({
++            name: "portable-greet",
++            content: expect.stringContaining("Say hello from the portable plugin."),
++          })
++          const inspect = mcp.transform((editor) => {
++            expect(editor.list().map(([name]) => String(name))).toContain("portable-server")
++            expect(structuredClone(editor.get("portable-server"))).toMatchObject({
++              type: "local",
++              command: ["node", path.join(root, "server.cjs"), expect.any(String), "${UNKNOWN}"],
++              cwd: root,
++              environment: { PLUGIN_ROOT: root, PLUGIN_DATA: expect.any(String), FIXTURE_ROOT: root },
++            })
++          })
++          yield* (yield* inspect).dispose
++          const skillFile = path.join(root, "skills/portable-greet/SKILL.md")
++          yield* Effect.promise(async () => {
++            await Bun.write(skillFile, (await Bun.file(skillFile).text()).replace("Say hello", "Say goodbye"))
++            await Bun.write(
++              path.join(root, "mcp.json"),
++              JSON.stringify({
++                $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
++                mcpServers: {},
++              }),
++            )
++          })
++          yield* watcher.emit({ type: "update", path: skillFile })
++          yield* skills
++            .get(Skill.ID.make("portable-greet"))
++            .pipe(
++              Effect.repeat({
++                until: (skill) => skill?.content.includes("Say goodbye") === true,
++                schedule: Schedule.spaced("5 millis"),
++              }),
++              Effect.timeout("5 seconds"),
++            )
++          yield* plugins.awaitActivation
++          yield* (yield* mcp.transform((editor) => {
++            expect(editor.get("portable-server")).toBeUndefined()
++          })).dispose
++          yield* Effect.promise(() => Bun.write(configFile, JSON.stringify({ plugins: ["-portable-fixture"] })))
++          yield* watcher.emit({ type: "update", path: configFile })
++          yield* plugins
++            .list()
++            .pipe(
++              Effect.repeat({
++                until: (list) => !list.some((plugin) => plugin.id === "portable-fixture"),
++                schedule: Schedule.spaced("5 millis"),
++              }),
++              Effect.timeout("5 seconds"),
++            )
++          yield* plugins.awaitActivation
++          expect(yield* skills.get(Skill.ID.make("portable-greet"))).toBeUndefined()
++          expect((yield* plugins.list()).some((plugin) => plugin.id === "portable-fixture")).toBe(false)
++          yield* (yield* mcp.transform((editor) => {
++            expect(editor.get("portable-server")).toBeUndefined()
++          })).dispose
++        }).pipe(
++          Effect.scoped,
++          Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(directory.path) }))),
++        )
++      }),
++    )
++  }
++
+   ;(
+     [
+       { name: "on a helper-only save", helper: "nested/helper.ts", touchEntry: false },

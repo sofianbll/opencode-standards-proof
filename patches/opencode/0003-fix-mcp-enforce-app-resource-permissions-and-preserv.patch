@@ -1,0 +1,527 @@
+From d8b73f3b2177ee0527f97e60948cc55b12813c05 Mon Sep 17 00:00:00 2001
+From: sofianbll <174883520+sofianbll@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:10:17 +0200
+Subject: [PATCH 3/3] fix(mcp): enforce app resource permissions and preserve
+ callback actor
+
+---
+ packages/client/src/effect/api/api.ts         |  3 +-
+ .../client/src/effect/generated/client.ts     |  7 +-
+ .../client/src/promise/generated/client.ts    |  7 +-
+ .../client/src/promise/generated/types.ts     | 27 +++++---
+ packages/core/src/plugin/agent-package.ts     |  1 +
+ packages/core/src/tool/mcp.ts                 | 24 +++++--
+ packages/core/src/tool/plugin/mcp-resource.ts | 22 ++++--
+ packages/core/test/mcp.test.ts                | 69 +++++++++++++------
+ packages/protocol/src/groups/session.ts       | 13 +++-
+ packages/server/src/handlers/session.ts       | 14 +++-
+ packages/server/test/mcp-call.test.ts         | 56 ++++++++++++++-
+ 11 files changed, 192 insertions(+), 51 deletions(-)
+
+diff --git a/packages/client/src/effect/api/api.ts b/packages/client/src/effect/api/api.ts
+index 3ebd0d2..2f414ad 100644
+--- a/packages/client/src/effect/api/api.ts
++++ b/packages/client/src/effect/api/api.ts
+@@ -4,6 +4,7 @@ import type { Location } from "@opencode/schema/location"
+ import type { Agent } from "@opencode/schema/agent"
+ import type { Plugin } from "@opencode/schema/plugin"
+ import type { Session } from "@opencode/schema/session"
++import type { SessionMessage } from "@opencode/schema/session-message"
+ import type { Mcp } from "@opencode/schema/mcp"
+ import type { AbsolutePath } from "@opencode/schema/schema"
+ import type { Project } from "@opencode/schema/project"
+@@ -12,7 +13,6 @@ import type { Money } from "@opencode/schema/money"
+ import type { Model } from "@opencode/schema/model"
+ import type { DateTime } from "effect"
+ import type { Permission } from "@opencode/schema/permission"
+-import type { SessionMessage } from "@opencode/schema/session-message"
+ import type { SessionInbox } from "@opencode/schema/session-inbox"
+ import type { PromptInput } from "@opencode/schema/prompt-input"
+ import type { AgentAttachment } from "@opencode/schema/prompt"
+@@ -121,6 +121,7 @@ export type SessionMcpCallInput = {
+   readonly server: string
+   readonly tool: string
+   readonly arguments: { readonly [x: string]: unknown }
++  readonly messageID?: SessionMessage.ID
+ }
+ export type SessionMcpCallOutput = Mcp.CallToolResult
+ export type SessionMcpCallOperation<E = never> = (input: SessionMcpCallInput) => Effect.Effect<SessionMcpCallOutput, E>
+diff --git a/packages/client/src/effect/generated/client.ts b/packages/client/src/effect/generated/client.ts
+index 5001374..512b756 100644
+--- a/packages/client/src/effect/generated/client.ts
++++ b/packages/client/src/effect/generated/client.ts
+@@ -381,7 +381,12 @@ const EndpointSessionMcpCall = (raw: RawClient["server.session"]) => (input: Ses
+   preserveEffect<SessionMcpCallOutput>()(
+     raw["session.mcp.call"]({
+       params: { sessionID: input["sessionID"] },
+-      payload: { server: input["server"], tool: input["tool"], arguments: input["arguments"] },
++      payload: {
++        server: input["server"],
++        tool: input["tool"],
++        arguments: input["arguments"],
++        messageID: input["messageID"],
++      },
+     }).pipe(Effect.mapError(mapClientError)),
+   )
+ 
+diff --git a/packages/client/src/promise/generated/client.ts b/packages/client/src/promise/generated/client.ts
+index bd43271..17ef92e 100644
+--- a/packages/client/src/promise/generated/client.ts
++++ b/packages/client/src/promise/generated/client.ts
+@@ -548,7 +548,12 @@ export function make(options: ClientOptions) {
+             {
+               method: "POST",
+               path: `/api/session/${encodeURIComponent(input.sessionID)}/mcp/call`,
+-              body: { server: input["server"], tool: input["tool"], arguments: input["arguments"] },
++              body: {
++                server: input["server"],
++                tool: input["tool"],
++                arguments: input["arguments"],
++                messageID: input["messageID"],
++              },
+               successStatus: 200,
+               declaredStatuses: [400, 401, 403, 404],
+               empty: false,
+diff --git a/packages/client/src/promise/generated/types.ts b/packages/client/src/promise/generated/types.ts
+index 9e1e8ba..2fedb6f 100644
+--- a/packages/client/src/promise/generated/types.ts
++++ b/packages/client/src/promise/generated/types.ts
+@@ -2747,6 +2747,15 @@ export type SessionNotFoundError = {
+ export const isSessionNotFoundError = (value: unknown): value is SessionNotFoundError =>
+   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "SessionNotFoundError"
+ 
++export type MessageNotFoundError = {
++  readonly _tag: "MessageNotFoundError"
++  readonly sessionID: string
++  readonly messageID: string
++  readonly message: string
++}
++export const isMessageNotFoundError = (value: unknown): value is MessageNotFoundError =>
++  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "MessageNotFoundError"
++
+ export type InvalidCursorError = { readonly _tag: "InvalidCursorError"; readonly message: string }
+ export const isInvalidCursorError = (value: unknown): value is InvalidCursorError =>
+   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "InvalidCursorError"
+@@ -2767,15 +2776,6 @@ export type UnknownError = {
+ export const isUnknownError = (value: unknown): value is UnknownError =>
+   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "UnknownError"
+ 
+-export type MessageNotFoundError = {
+-  readonly _tag: "MessageNotFoundError"
+-  readonly sessionID: string
+-  readonly messageID: string
+-  readonly message: string
+-}
+-export const isMessageNotFoundError = (value: unknown): value is MessageNotFoundError =>
+-  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "MessageNotFoundError"
+-
+ export type CommandNotFoundError = {
+   readonly _tag: "CommandNotFoundError"
+   readonly command: string
+@@ -2999,17 +2999,26 @@ export type SessionMcpCallInput = {
+     readonly server: string
+     readonly tool: string
+     readonly arguments: { readonly [x: string]: unknown }
++    readonly messageID?: string
+   }["server"]
+   readonly tool: {
+     readonly server: string
+     readonly tool: string
+     readonly arguments: { readonly [x: string]: unknown }
++    readonly messageID?: string
+   }["tool"]
+   readonly arguments: {
+     readonly server: string
+     readonly tool: string
+     readonly arguments: { readonly [x: string]: unknown }
++    readonly messageID?: string
+   }["arguments"]
++  readonly messageID?: {
++    readonly server: string
++    readonly tool: string
++    readonly arguments: { readonly [x: string]: unknown }
++    readonly messageID?: string
++  }["messageID"]
+ }
+ 
+ export type SessionMcpCallOutput = McpCallToolResult
+diff --git a/packages/core/src/plugin/agent-package.ts b/packages/core/src/plugin/agent-package.ts
+index a80bf71..e8c200c 100644
+--- a/packages/core/src/plugin/agent-package.ts
++++ b/packages/core/src/plugin/agent-package.ts
+@@ -101,6 +101,7 @@ async function readSkills(root: string): Promise<Skill.Info[]> {
+         const markdown = ConfigMarkdown.parse(content)
+         const frontmatter = Schema.decodeUnknownSync(Frontmatter)(markdown.data)
+         if (frontmatter.name !== name) throw new Error("Skill name must match its directory")
++        // shortcut: SkillFile accepts raw text only; reuse this markdown when its parser accepts parsed input.
+         const parsed = SkillFile.parse(directory, file, content)
+         return parsed._tag === "Parsed" ? [parsed.skill] : []
+       } catch (error) {
+diff --git a/packages/core/src/tool/mcp.ts b/packages/core/src/tool/mcp.ts
+index d1cd4eb..e6cee62 100644
+--- a/packages/core/src/tool/mcp.ts
++++ b/packages/core/src/tool/mcp.ts
+@@ -9,6 +9,7 @@ import { Bus } from "../bus.js"
+ import { Mcp } from "../mcp/index.js"
+ import { Permission } from "../permission.js"
+ import { Tool } from "../tool.js"
++import { McpResourceTools } from "./plugin/mcp-resource.js"
+ 
+ /**
+  * Registry namespace and permission action names for MCP tools.
+@@ -94,9 +95,20 @@ export const layer = Layer.effect(
+                       embedded?.type === "resource"
+                         ? embedded.resource
+                         : uri
+-                          ? (yield* mcp
+-                              .readResource({ server: tool.server, uri })
+-                              .pipe(Effect.orElseSucceed(() => undefined)))?.contents.find((part) => part.uri === uri)
++                          ? (yield* McpResourceTools.read(mcp, permission)(
++                              { server: tool.server, uri },
++                              {
++                                sessionID: context.sessionID,
++                                agent: context.agent,
++                                source: { type: "tool", messageID: context.messageID, id: context.id },
++                              },
++                            ).pipe(
++                              Effect.orElseSucceed(() => undefined),
++                              // Optional app loading must not discard an already completed tool result.
++                              Effect.catchDefect((defect) =>
++                                defect instanceof Permission.DeclinedError ? Effect.undefined : Effect.die(defect),
++                              ),
++                            ))?.contents.find((part) => part.uri === uri)
+                           : undefined
+                     const metadata = {
+                       mcp: {
+@@ -105,11 +117,11 @@ export const layer = Layer.effect(
+                         ...(tool._meta === undefined ? {} : { toolMeta: tool._meta }),
+                         ...(result.raw._meta === undefined ? {} : { resultMeta: result.raw._meta }),
+                         ...(result.structured === undefined ? {} : { structuredContent: result.structured }),
+-                        ...(resource && "text" in resource
++                        ...(resource && "text" in resource && resource.mimeType === "text/html;profile=mcp-app"
+                           ? {
+                               ui: {
+                                 resourceUri: resource.uri,
+-                                mimeType: resource.mimeType ?? "text/html;profile=mcp-app",
++                                mimeType: resource.mimeType,
+                                 html: resource.text,
+                                 ...(resource._meta === undefined ? {} : { meta: resource._meta }),
+                               },
+@@ -199,6 +211,6 @@ function resourceUri(...metas: Array<Record<string, unknown> | undefined>) {
+   for (const meta of metas) {
+     const ui = meta?.ui
+     const uri = ui && typeof ui === "object" && "resourceUri" in ui ? ui.resourceUri : meta?.["ui/resourceUri"]
+-    if (typeof uri === "string") return uri
++    if (typeof uri === "string" && uri.startsWith("ui://")) return uri
+   }
+ }
+diff --git a/packages/core/src/tool/plugin/mcp-resource.ts b/packages/core/src/tool/plugin/mcp-resource.ts
+index f7bf6e3..18b4fa1 100644
+--- a/packages/core/src/tool/plugin/mcp-resource.ts
++++ b/packages/core/src/tool/plugin/mcp-resource.ts
+@@ -6,6 +6,21 @@ import { Effect, Schema } from "effect"
+ import { Mcp } from "../../mcp/index.js"
+ import { Permission } from "../../permission.js"
+ 
++export const read = (mcp: Mcp.Interface, permission: Permission.Interface) =>
++  Effect.fn("McpResourceTools.read")(function* (
++    input: Parameters<Mcp.Interface["readResource"]>[0],
++    context: Pick<Permission.AssertInput, "sessionID" | "agent" | "source">,
++  ) {
++    yield* permission.assert({
++      action: "opencode_read_mcp_resource",
++      resources: [`${input.server}:${input.uri}`],
++      save: [`${input.server}:*`],
++      metadata: { server: input.server, uri: input.uri },
++      ...context,
++    })
++    return yield* mcp.readResource(input)
++  })
++
+ export const Plugin = {
+   id: "opencode.tools.mcp-resources",
+   effect: Effect.fn("McpResourceTools.Plugin")(function* (ctx: Context) {
+@@ -62,16 +77,11 @@ export const Plugin = {
+           output: Mcp.ResourceContent,
+           execute: (input, context) =>
+             Effect.gen(function* () {
+-              yield* permission.assert({
+-                action: "opencode_read_mcp_resource",
+-                resources: [`${input.server}:${input.uri}`],
+-                save: [`${input.server}:*`],
+-                metadata: { server: input.server, uri: input.uri },
++              const resource = yield* read(mcp, permission)(input, {
+                 sessionID: context.sessionID,
+                 agent: context.agent,
+                 source: { type: "tool", messageID: context.messageID, id: context.id },
+               })
+-              const resource = yield* mcp.readResource(input)
+               if (!resource)
+                 return yield* new ToolFailure({
+                   message: `MCP server "${input.server}" is not connected or does not expose resources`,
+diff --git a/packages/core/test/mcp.test.ts b/packages/core/test/mcp.test.ts
+index f33a19c..8a31044 100644
+--- a/packages/core/test/mcp.test.ts
++++ b/packages/core/test/mcp.test.ts
+@@ -95,7 +95,7 @@ function resourceServer(
+     listChanged?: boolean
+     emptyElicitation?: boolean
+     urlElicitation?: boolean
+-    app?: { embedded: boolean; error?: boolean }
++    app?: { embedded: boolean; error?: boolean; uri?: string; mimeType?: string }
+     respond?: (request: Request) => Response | undefined | Promise<Response | undefined>
+   } = {},
+ ) {
+@@ -154,7 +154,9 @@ function resourceServer(
+                     {
+                       name: "echo",
+                       inputSchema: { type: "object" as const, properties: {} },
+-                      ...(input.app ? { _meta: { ui: { resourceUri: "ui://demo/counter" }, definition: true } } : {}),
++                      ...(input.app
++                        ? { _meta: { ui: { resourceUri: input.app.uri ?? "ui://demo/counter" }, definition: true } }
++                        : {}),
+                     },
+                   ],
+           })
+@@ -212,8 +214,8 @@ function resourceServer(
+                             {
+                               type: "resource" as const,
+                               resource: {
+-                                uri: "ui://demo/counter",
+-                                mimeType: "text/html;profile=mcp-app",
++                                uri: input.app.uri ?? "ui://demo/counter",
++                                mimeType: input.app.mimeType ?? "text/html;profile=mcp-app",
+                                 text: "<h1>Counter</h1>",
+                                 _meta: { ui: { csp: { connectDomains: ["https://example.com"] } } },
+                               },
+@@ -224,7 +226,7 @@ function resourceServer(
+                     structuredContent: { count: 0 },
+                     ...(input.app.error ? { isError: true } : {}),
+                     _meta: {
+-                      ...(input.app.embedded ? { ui: { resourceUri: "ui://demo/counter" } } : {}),
++                      ...(input.app.embedded ? { ui: { resourceUri: input.app.uri ?? "ui://demo/counter" } } : {}),
+                       private: "guest-only",
+                     },
+                   }
+@@ -655,19 +657,24 @@ testEffect(Layer.empty).live("authorizes app callbacks before MCP and returns th
+   }),
+ )
+ 
+-for (const { embedded, error } of [
++for (const { embedded, error, denied, uri = "ui://demo/counter", mimeType = "text/html;profile=mcp-app" } of [
+   { embedded: true, error: false },
+   { embedded: false, error: false },
+   { embedded: true, error: true },
++  { embedded: false, error: false, denied: true },
++  { embedded: false, error: false, uri: "https://example.com/counter" },
++  { embedded: true, error: false, uri: "docs://counter" },
++  { embedded: false, error: false, mimeType: "text/html" },
++  { embedded: true, error: false, mimeType: "text/plain" },
+ ]) {
+   testEffect(Layer.empty).live(
+-    `keeps ${embedded ? "embedded" : "fetched"} MCP apps in metadata, never model content${error ? " on error" : ""}`,
++    `keeps ${embedded ? "embedded" : "fetched"} MCP apps in metadata, never model content${error ? " on error" : ""}${denied ? " unless resource read denied" : ""} (${uri}, ${mimeType})`,
+     () =>
+       Effect.gen(function* () {
+-        const server = yield* resourceServer({ app: { embedded, error } })
++        const server = yield* resourceServer({ app: { embedded, error, uri, mimeType } })
+         server.state.contents.push({
+-          uri: "ui://demo/counter",
+-          mimeType: "text/html;profile=mcp-app",
++          uri,
++          mimeType,
+           text: "<h1>Counter</h1>",
+           _meta: { ui: { csp: { connectDomains: ["https://example.com"] } } },
+         })
+@@ -697,23 +704,43 @@ for (const { embedded, error } of [
+             expect(result.metadata?.mcp).toEqual({
+               server: "resources",
+               tool: "echo",
+-              toolMeta: { ui: { resourceUri: "ui://demo/counter" }, definition: true },
+-              resultMeta: { ...(embedded ? { ui: { resourceUri: "ui://demo/counter" } } : {}), private: "guest-only" },
++              toolMeta: { ui: { resourceUri: uri }, definition: true },
++              resultMeta: { ...(embedded ? { ui: { resourceUri: uri } } : {}), private: "guest-only" },
+               structuredContent: { count: 0 },
+-              ui: {
+-                resourceUri: "ui://demo/counter",
+-                mimeType: "text/html;profile=mcp-app",
+-                html: "<h1>Counter</h1>",
+-                meta: { ui: { csp: { connectDomains: ["https://example.com"] } } },
+-              },
++              ...(!denied && uri.startsWith("ui://") && mimeType === "text/html;profile=mcp-app"
++                ? {
++                    ui: {
++                      resourceUri: "ui://demo/counter",
++                      mimeType: "text/html;profile=mcp-app",
++                      html: "<h1>Counter</h1>",
++                      meta: { ui: { csp: { connectDomains: ["https://example.com"] } } },
++                    },
++                  }
++                : {}),
+             })
+-            expect(result.content).toEqual([{ type: "text", text: "Counter ready" }])
+-            expect(server.state.resourceReads).toEqual(embedded ? [] : ["ui://demo/counter"])
++            expect(result.content).toEqual([
++              { type: "text", text: "Counter ready" },
++                ...(!uri.startsWith("ui://") && embedded ? [{ type: "text" as const, text: "<h1>Counter</h1>" }] : []),
++            ])
++            expect(server.state.resourceReads).toEqual(embedded || denied || !uri.startsWith("ui://") ? [] : [uri])
+           }).pipe(
+             Effect.provide(
+               AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
+                 Mcp.node.replace(Layer.succeed(Mcp.Service, service)),
+-                Permission.node.replace(Layer.mock(Permission.Service, { assert: () => Effect.void })),
++                Permission.node.replace(
++                  Layer.mock(Permission.Service, {
++                    assert: (input) =>
++                      denied && input.action === "opencode_read_mcp_resource"
++                        ? Effect.fail(
++                            new Permission.BlockedError({
++                              rules: [],
++                              permission: input.action,
++                              resources: input.resources,
++                            }),
++                          )
++                        : Effect.void,
++                  }),
++                ),
+                 Bus.node.replace(events),
+                 Image.node.replace(imagePassthrough),
+               ]),
+diff --git a/packages/protocol/src/groups/session.ts b/packages/protocol/src/groups/session.ts
+index e0e3209..bfa6930 100644
+--- a/packages/protocol/src/groups/session.ts
++++ b/packages/protocol/src/groups/session.ts
+@@ -105,9 +105,15 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
+     .add(
+       HttpApiEndpoint.post("session.mcp.call", "/api/session/:sessionID/mcp/call", {
+         params: { sessionID: Session.ID },
+-        payload: Mcp.CallToolInput,
++        payload: Schema.Struct({ ...Mcp.CallToolInput.fields, messageID: SessionMessage.ID.pipe(Schema.optionalKey) }),
+         success: Mcp.CallToolResult,
+-        error: [ForbiddenError, McpServerNotFoundError, InvalidRequestError, SessionNotFoundError],
++        error: [
++          ForbiddenError,
++          McpServerNotFoundError,
++          InvalidRequestError,
++          SessionNotFoundError,
++          MessageNotFoundError,
++        ],
+       })
+         .middleware(sessionLocationMiddleware)
+         .annotateMerge(OpenApi.annotations({ identifier: "session.mcp.call", summary: "Call an MCP app tool" })),
+@@ -300,7 +306,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
+           metadata: Session.Metadata.pipe(Schema.optional),
+           permissions: Permission.Ruleset.pipe(Schema.optional),
+           archived: Schema.Boolean.pipe(Schema.optional).annotate({
+-            description: "Archive the session with true or restore it with false. Repeating the current state is a no-op.",
++            description:
++              "Archive the session with true or restore it with false. Repeating the current state is a no-op.",
+           }),
+         }),
+         success: HttpApiSchema.NoContent,
+diff --git a/packages/server/src/handlers/session.ts b/packages/server/src/handlers/session.ts
+index d486f60..09527f4 100644
+--- a/packages/server/src/handlers/session.ts
++++ b/packages/server/src/handlers/session.ts
+@@ -69,9 +69,21 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
+           const info = yield* session
+             .get(ctx.params.sessionID)
+             .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
++          const message =
++            ctx.payload.messageID === undefined
++              ? undefined
++              : yield* session.message({ sessionID: info.id, messageID: ctx.payload.messageID })
++          if (ctx.payload.messageID !== undefined && !message)
++            return yield* new MessageNotFoundError({
++              sessionID: info.id,
++              messageID: ctx.payload.messageID,
++              message: `Message not found: ${ctx.payload.messageID}`,
++            })
++          if (message && message.type !== "assistant")
++            return yield* new InvalidRequestError({ message: "MCP app callbacks require an assistant message" })
+           const result = yield* McpTool.call(mcp, permission)(
+             { server: ctx.payload.server, name: ctx.payload.tool, args: ctx.payload.arguments },
+-            { sessionID: info.id, agent: info.agent },
++            { sessionID: info.id, agent: message?.agent ?? info.agent },
+           ).pipe(
+             Effect.catchTags({
+               "Permission.BlockedError": (error) => new ForbiddenError({ message: error.message }),
+diff --git a/packages/server/test/mcp-call.test.ts b/packages/server/test/mcp-call.test.ts
+index e3fc3bc..7c903b0 100644
+--- a/packages/server/test/mcp-call.test.ts
++++ b/packages/server/test/mcp-call.test.ts
+@@ -1,5 +1,5 @@
+ import { expect } from "bun:test"
+-import { Effect, Schema } from "effect"
++import { Effect, Schema, Schedule } from "effect"
+ import { Session } from "@opencode/schema/session"
+ import { createMcpHandler, Server } from "@modelcontextprotocol/server"
+ import { it } from "../../core/test/lib/effect"
+@@ -44,7 +44,15 @@ it.live("MCP app callback uses session permissions and returns the full MCP resp
+       password: "test-callback-password",
+       app: { version: "test" },
+       database: { path: ":memory:" },
+-      config: { project: false },
++      config: {
++        project: false,
++        content: JSON.stringify({
++          agents: {
++            original: { permissions: [{ action: "*", resource: "*", effect: "allow" }] },
++            current: { permissions: [{ action: "*", resource: "*", effect: "deny" }] },
++          },
++        }),
++      },
+       models: { fetch: false },
+       fs: { filewatcher: false },
+     })
+@@ -123,5 +131,49 @@ it.live("MCP app callback uses session permissions and returns the full MCP resp
+         })).status,
+       ).toBe(400)
+     }
++    const created = yield* post("/api/session", {})
++    const template = Schema.decodeUnknownSync(Schema.Struct({ data: Schema.toEncoded(Session.Info) }))(
++      yield* Effect.promise(() => created.json()),
++    ).data
++    const owner = Session.ID.create()
++    const imported = yield* post("/api/experimental/session/import", {
++      info: { ...template, id: owner, agent: "current", permissions: [] },
++      messages: [
++        {
++          id: "msg_app_origin",
++          type: "assistant",
++          agent: "original",
++          model: { providerID: "test", id: "test" },
++          content: [],
++          time: { created: 0, completed: 1 },
++        },
++      ],
++    })
++    expect(imported.status).toBe(200)
++    // Agent configuration is installed asynchronously by the location plugins.
++    yield* Effect.promise(async () => {
++      const response = await handler(
++        new Request("http://opencode.local/api/agent/original", {
++          headers: { authorization: `Basic ${btoa("opencode:test-callback-password")}` },
++        }),
++      )
++      return response.status === 200
++    }).pipe(
++      Effect.repeat({ while: (ready) => !ready, schedule: Schedule.spaced("10 millis") }),
++      Effect.timeout("5 seconds"),
++    )
++    const callback = { server: "demo", tool: "increment_counter", arguments: {} }
++    expect((yield* post(`/api/session/${owner}/mcp/call`, callback)).status).toBe(403)
++    const before = calls.length
++    expect((yield* post(`/api/session/${owner}/mcp/call`, { ...callback, messageID: "msg_missing" })).status).toBe(404)
++    expect(
++      (yield* post(`/api/session/${template.id}/mcp/call`, { ...callback, messageID: "msg_app_origin" })).status,
++    ).toBe(404)
++    expect(calls).toHaveLength(before)
++    const actorResponse = yield* post(`/api/session/${owner}/mcp/call`, { ...callback, messageID: "msg_app_origin" })
++    expect({ status: actorResponse.status, body: yield* Effect.promise(() => actorResponse.json()) }).toMatchObject({
++      status: 200,
++    })
++    expect(calls).toHaveLength(before + 1)
+   }).pipe(Effect.scoped),
+ )

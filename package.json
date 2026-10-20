@@ -1,0 +1,12 @@
+{
+  "name": "standards-mcp-apps-proof",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "bash e2e/run.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.59.1",
+    "node": "24.14.1"
+  }
+}

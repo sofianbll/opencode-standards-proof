@@ -1,0 +1,97 @@
+{
+  "console": [
+    {
+      "type": "warning",
+      "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+    },
+    {
+      "type": "warning",
+      "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "warning",
+      "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security\n  Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of\n  this app to unnecessary security risks.\n\nFor more information and help, consult\nhttps://electronjs.org/docs/tutorial/security.\nThis warning will not show up\nonce the app is packaged."
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "type": "error",
+      "text": "Connecting to 'https://example.com/mcp-proof' violates the following Content Security Policy directive: \"connect-src 'none'\". The action has been blocked."
+    },
+    {
+      "type": "error",
+      "text": "Fetch API cannot load https://example.com/mcp-proof. Refused to connect because it violates the document's Content Security Policy."
+    },
+    {
+      "type": "error",
+      "text": "Loading the image 'https://example.com/mcp-proof.png' violates the following Content Security Policy directive: \"img-src 'self' data: blob:\". The action has been blocked."
+    }
+  ],
+  "pageErrors": [],
+  "crashes": [],
+  "navigations": [
+    {
+      "networkGuard": "https://models.dev/logos/opencode-go.svg"
+    },
+    {
+      "networkGuard": "https://models.dev/logos/vercel.svg"
+    },
+    {
+      "networkGuard": "https://models.dev/logos/mock.svg"
+    },
+    {
+      "networkGuard": "https://models.dev/logos/opencode-go.svg"
+    },
+    {
+      "networkGuard": "https://models.dev/logos/vercel.svg"
+    },
+    {
+      "networkGuard": "https://models.dev/logos/mock.svg"
+    },
+    {
+      "networkGuard": "https://models.dev/logos/mock.svg"
+    },
+    {
+      "url": "https://example.com/",
+      "isMainFrame": false,
+      "prevented": true
+    }
+  ],
+  "url": "openchamber-ui://app/index.html",
+  "csp": {
+    "fetchRejected": true,
+    "violations": [
+      "connect-src",
+      "img-src"
+    ]
+  },
+  "frameBefore": "about:srcdoc",
+  "frameAfter": "about:srcdoc",
+  "result": "PASS"
+}

@@ -1,0 +1,373 @@
+From 3045d1eeaa94fe0e3daf271ede04494bbb1f8952 Mon Sep 17 00:00:00 2001
+From: sofianbll <174883520+sofianbll@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:10:37 +0200
+Subject: [PATCH 3/3] fix(mcp): bind callbacks to origin messages and disable
+ navigated frames
+
+---
+ .../chat/message/parts/DOCUMENTATION.md       | 11 +++++---
+ .../chat/message/parts/McpAppFrame.tsx        | 25 +++++++++++++------
+ .../message/parts/ToolPart.mcp-app.test.tsx   | 13 +++++++---
+ .../chat/message/parts/ToolPart.tsx           |  2 +-
+ packages/ui/src/lib/i18n/messages/ar.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/de.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/en.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/es.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/fr.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/he.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/ja.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/ko.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/nl.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/pl.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/pt-BR.ts    |  1 +
+ packages/ui/src/lib/i18n/messages/tr.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/uk.ts       |  1 +
+ packages/ui/src/lib/i18n/messages/zh-CN.ts    |  1 +
+ packages/ui/src/lib/i18n/messages/zh-TW.ts    |  1 +
+ packages/ui/src/lib/opencode/client.ts        |  2 +-
+ 20 files changed, 52 insertions(+), 16 deletions(-)
+
+diff --git a/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md b/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
+index ba30df1..10cbcb8 100644
+--- a/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
++++ b/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
+@@ -91,7 +91,7 @@ Use this doc when you ask an agent to change tool/header/description behavior.
+ 
+ ### MCP Apps proof
+ 
+-Web and Electron render `state.metadata.mcp.ui.html` at the start of the expanded
++Web and Electron render `state.metadata.mcp.ui.html` in place of the expanded
+ tool result, including empty text and error results. VS Code, hosted mobile and
+ Capacitor retain their existing text output. The tool row remains collapsible;
+ folding it destroys the app's local state.
+@@ -107,10 +107,15 @@ The JSON-RPC adapter supports only `ui/initialize`,
+ `ui/notifications/initialized` and `tools/call`. Initialization advertises
+ `serverTools: {}` so apps can enable their tool controls. It grants no browser
+ permissions, resource access or external origins. Calls after initialization are restricted to the part's MCP
+-server, show a visible tool-request status, and use the owning `part.sessionID`
+-and session directory. Server-side permission requests still reach PermissionDock.
++server, show a visible tool-request status, and use the owning `part.sessionID`,
++`part.messageID` and session directory. The server checks the message's agent,
++even after the session changes agent. Server-side permission requests still reach PermissionDock.
+ Missing ownership fails closed. Exact source-window identity, runtime identity,
+ effect cleanup and frame ownership gate requests and asynchronous replies.
++After the initial srcDoc load, any further frame load permanently disables
++requests and replies and aborts pending callbacks. The status shows that the app
++navigated away. Web CSP cannot prevent the outbound navigation itself, a limit
++shared with extension iframes. Electron blocks it in the native navigation hook.
+ 
+ ### Why the extension policy is reused
+ 
+diff --git a/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx b/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx
+index 2afdb2d..7049b3e 100644
+--- a/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx
++++ b/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx
+@@ -6,9 +6,11 @@ import { getAllSyncSessionMap, getSyncSessionDirectory } from '@/sync/sync-refs'
+ import { getRuntimeKey, subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
+ import { useI18n } from '@/lib/i18n';
+ 
+-export function McpAppFrame({ app, sessionID }: { app: McpApp; sessionID: string }) {
++export function McpAppFrame({ app, sessionID, messageID }: { app: McpApp; sessionID: string; messageID: string }) {
+   const { t } = useI18n();
+   const frameRef = React.useRef<HTMLIFrameElement>(null);
++  const loads = React.useRef(0);
++  const [navigated, setNavigated] = React.useState(false);
+   const [callStatus, setCallStatus] = React.useState<{ tool: string; failed: boolean } | null>(null);
+   const srcDoc = React.useMemo(() => {
+     const document = new DOMParser().parseFromString(app.ui.html, 'text/html');
+@@ -17,19 +19,25 @@ export function McpAppFrame({ app, sessionID }: { app: McpApp; sessionID: string
+     return `<!doctype html>\n${document.documentElement.outerHTML}`;
+   }, [app.ui.html]);
+ 
+-  React.useEffect(() => {
++  React.useLayoutEffect(() => {
+     const frame = frameRef.current;
+     const runtimeKey = getRuntimeKey();
+     const controller = new AbortController();
+     let disposed = false;
+-    const ownsFrame = () => !disposed && frame !== null && frameRef.current === frame && getRuntimeKey() === runtimeKey;
++    const ownsFrame = () => !disposed && loads.current < 2 && frame !== null && frameRef.current === frame && getRuntimeKey() === runtimeKey;
++    const onLoad = () => {
++      if (++loads.current < 2) return;
++      disposed = true;
++      controller.abort();
++      setNavigated(true);
++    };
+     const bridge = createMcpAppBridge({ server: app.server, callTool: async (call) => {
+       if (!ownsFrame()) throw new Error('App is no longer active');
+       const directory = getAllSyncSessionMap().get(sessionID)?.directory ?? getSyncSessionDirectory(sessionID);
+       if (!directory) throw new Error('Owning session directory is unavailable');
+       setCallStatus({ tool: call.tool, failed: false });
+       try {
+-        return await opencodeClient.callMcpTool({ sessionID, ...call }, directory, controller.signal);
++        return await opencodeClient.callMcpTool({ sessionID, messageID, ...call }, directory, controller.signal);
+       } catch (error) {
+         if (ownsFrame()) setCallStatus({ tool: call.tool, failed: true });
+         throw error;
+@@ -44,15 +52,16 @@ export function McpAppFrame({ app, sessionID }: { app: McpApp; sessionID: string
+     };
+     const unsubscribe = subscribeRuntimeEndpointChanged(() => { disposed = true; controller.abort(); });
+     window.addEventListener('message', onMessage);
+-    return () => { disposed = true; controller.abort(); unsubscribe(); window.removeEventListener('message', onMessage); };
+-  }, [app.server, sessionID, srcDoc]);
++    frame?.addEventListener('load', onLoad);
++    return () => { disposed = true; controller.abort(); unsubscribe(); window.removeEventListener('message', onMessage); frame?.removeEventListener('load', onLoad); };
++  }, [app.server, sessionID, messageID, srcDoc]);
+ 
+   return <div>
+     <iframe ref={frameRef} data-testid="mcp-app-frame" title={t('chat.toolPart.mcpAppTitle')}
+       sandbox="allow-scripts" srcDoc={srcDoc} className="w-full h-80 border-0" />
+     <div data-testid="mcp-app-status" role="status" className="typography-meta text-muted-foreground h-5 truncate"
+-      title={callStatus ? t(callStatus.failed ? 'chat.toolPart.mcpAppCallFailed' : 'chat.toolPart.mcpAppCall', { tool: callStatus.tool }) : undefined}>
+-      {callStatus ? t(callStatus.failed ? 'chat.toolPart.mcpAppCallFailed' : 'chat.toolPart.mcpAppCall', { tool: callStatus.tool }) : ''}
++      title={navigated ? t('chat.toolPart.mcpAppNavigated') : callStatus ? t(callStatus.failed ? 'chat.toolPart.mcpAppCallFailed' : 'chat.toolPart.mcpAppCall', { tool: callStatus.tool }) : undefined}>
++      {navigated ? t('chat.toolPart.mcpAppNavigated') : callStatus ? t(callStatus.failed ? 'chat.toolPart.mcpAppCallFailed' : 'chat.toolPart.mcpAppCall', { tool: callStatus.tool }) : ''}
+     </div>
+   </div>;
+ }
+diff --git a/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx b/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx
+index 7052b77..a00904c 100644
+--- a/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx
++++ b/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx
+@@ -32,7 +32,7 @@ test('an app-only tool result renders an opaque frame with the extension CSP bef
+   const descriptors = new Map<string, PropertyDescriptor | undefined>();
+   for (const [name, value] of Object.entries({
+     window: browser, document: browser.document, navigator: browser.navigator, localStorage: browser.localStorage,
+-    Node: browser.Node, Text: browser.Text, NodeList: browser.NodeList, Element: browser.Element,
++    Node: browser.Node, Text: browser.Text, NodeList: browser.NodeList, Element: browser.Element, Event: browser.Event,
+     HTMLElement: browser.HTMLElement, SVGElement: browser.SVGElement, DOMParser: browser.DOMParser, customElements: browser.customElements,
+     ResizeObserver: browser.ResizeObserver, MutationObserver: browser.MutationObserver,
+     requestAnimationFrame: browser.requestAnimationFrame.bind(browser), cancelAnimationFrame: browser.cancelAnimationFrame.bind(browser),
+@@ -98,7 +98,7 @@ test('an app-only tool result renders an opaque frame with the extension CSP bef
+     expect(calls).toHaveLength(0);
+     await send(call);
+     expect(calls).toEqual([{ url: '/api/session/ses_owner/mcp/call',
+-      body: JSON.stringify({ server: 'demo', tool: 'increment', arguments: { by: 1 } }), directory: '%2Frepo%2Fowner' }]);
++      body: JSON.stringify({ messageID: 'msg_app', server: 'demo', tool: 'increment', arguments: { by: 1 } }), directory: '%2Frepo%2Fowner' }]);
+     expect(replies.at(-1)).toEqual({ jsonrpc: '2.0', id: 2, result });
+     expect(host.querySelector('[data-testid="mcp-app-status"]')?.textContent).toContain('increment');
+     await send({ ...call, params: { ...call.params, server: 'other' } });
+@@ -110,9 +110,16 @@ test('an app-only tool result renders an opaque frame with the extension CSP bef
+     globalThis.fetch = async () => new Promise<Response>((resolve) => { finish = resolve; });
+     await send({ ...call, id: 3 });
+     const replyCount = replies.length;
+-    await act(async () => root.unmount());
++    await act(async () => { frame.dispatchEvent(new Event('load')); });
++    expect(host.querySelector('[data-testid="mcp-app-status"]')?.textContent).toBe('App navigated away — disabled');
+     await act(async () => finish(Response.json(result)));
+     expect(replies).toHaveLength(replyCount);
++    await send({ jsonrpc: '2.0', id: 4, method: 'ui/initialize' });
++    await send(call);
++    await act(async () => { frame.dispatchEvent(new Event('load')); });
++    await send(call);
++    expect(replies).toHaveLength(replyCount);
++    expect(calls).toHaveLength(1);
+   } finally {
+     globalThis.fetch = previousFetch;
+     await act(async () => root.unmount());
+diff --git a/packages/ui/src/components/chat/message/parts/ToolPart.tsx b/packages/ui/src/components/chat/message/parts/ToolPart.tsx
+index 548368e..305209c 100644
+--- a/packages/ui/src/components/chat/message/parts/ToolPart.tsx
++++ b/packages/ui/src/components/chat/message/parts/ToolPart.tsx
+@@ -1194,7 +1194,7 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
+     );
+ 
+     const renderResultContent = () => {
+-        if (mcpApp) return <McpAppFrame key={`${part.sessionID}:${part.id}`} app={mcpApp} sessionID={part.sessionID} />;
++        if (mcpApp) return <McpAppFrame key={`${part.sessionID}:${part.id}`} app={mcpApp} sessionID={part.sessionID} messageID={part.messageID} />;
+         const getEntryAbsolutePath = (entry: DiffPatchEntry) => toAbsoluteFilePath(currentDirectory, entry.filePath ?? entry.title);
+         const openEntryFile = (entry: DiffPatchEntry, event: React.MouseEvent<HTMLButtonElement>) => {
+             event.stopPropagation();
+diff --git a/packages/ui/src/lib/i18n/messages/ar.ts b/packages/ui/src/lib/i18n/messages/ar.ts
+index 05e65b6..db119d9 100644
+--- a/packages/ui/src/lib/i18n/messages/ar.ts
++++ b/packages/ui/src/lib/i18n/messages/ar.ts
+@@ -2645,6 +2645,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'تطبيق MCP',
+   'chat.toolPart.mcpAppCall': 'طلب التطبيق الأداة {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'فشل استدعاء أداة التطبيق: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'انتقل التطبيق إلى صفحة أخرى — تم تعطيله',
+   'chat.toolPart.questionsAsked': 'الأسئلة المطروحة: {count}',
+   'chat.toolPart.filesCount': 'الملفات: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} أخرى',
+diff --git a/packages/ui/src/lib/i18n/messages/de.ts b/packages/ui/src/lib/i18n/messages/de.ts
+index 81c4ad6..16b0ec4 100644
+--- a/packages/ui/src/lib/i18n/messages/de.ts
++++ b/packages/ui/src/lib/i18n/messages/de.ts
+@@ -2416,6 +2416,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'MCP-App',
+   'chat.toolPart.mcpAppCall': 'App hat Werkzeug {tool} angefordert',
+   'chat.toolPart.mcpAppCallFailed': 'Werkzeugaufruf der App fehlgeschlagen: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'App hat die Seite verlassen — deaktiviert',
+   'chat.toolPart.questionsAsked': 'Gestellte Fragen: {count}',
+   'chat.toolPart.filesCount': 'Dateien: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} weitere',
+diff --git a/packages/ui/src/lib/i18n/messages/en.ts b/packages/ui/src/lib/i18n/messages/en.ts
+index 2c8c0da..f967cb8 100644
+--- a/packages/ui/src/lib/i18n/messages/en.ts
++++ b/packages/ui/src/lib/i18n/messages/en.ts
+@@ -2700,6 +2700,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'MCP app',
+   'chat.toolPart.mcpAppCall': 'App requested tool {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'App tool call failed: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'App navigated away — disabled',
+   'chat.toolPart.questionsAsked': 'Questions asked: {count}',
+   'chat.toolPart.filesCount': 'Files: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} more',
+diff --git a/packages/ui/src/lib/i18n/messages/es.ts b/packages/ui/src/lib/i18n/messages/es.ts
+index 4ea90f9..e225eda 100644
+--- a/packages/ui/src/lib/i18n/messages/es.ts
++++ b/packages/ui/src/lib/i18n/messages/es.ts
+@@ -2654,6 +2654,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'Aplicación MCP',
+   'chat.toolPart.mcpAppCall': 'La aplicación solicitó la herramienta {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'Falló la llamada de la aplicación: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'La aplicación cambió de página — desactivada',
+   "chat.toolPart.questionsAsked": 'Preguntas realizadas: {count}',
+   "chat.toolPart.filesCount": 'Archivos: {count}',
+   "chat.toolPart.moreToolCalls": '+{count} más',
+diff --git a/packages/ui/src/lib/i18n/messages/fr.ts b/packages/ui/src/lib/i18n/messages/fr.ts
+index 789917d..745f3e5 100644
+--- a/packages/ui/src/lib/i18n/messages/fr.ts
++++ b/packages/ui/src/lib/i18n/messages/fr.ts
+@@ -2386,6 +2386,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'Application MCP',
+   'chat.toolPart.mcpAppCall': "L'application a demandé l'outil {tool}",
+   'chat.toolPart.mcpAppCallFailed': "Échec de l'appel de l'outil : {tool}",
++  'chat.toolPart.mcpAppNavigated': "L'application a changé de page — désactivée",
+   'chat.toolPart.questionsAsked': 'Questions posées : {count}',
+   'chat.toolPart.filesCount': 'Fichiers : {count}',
+   'chat.toolPart.moreToolCalls': '+{count} de plus',
+diff --git a/packages/ui/src/lib/i18n/messages/he.ts b/packages/ui/src/lib/i18n/messages/he.ts
+index d463fa5..0f126e3 100644
+--- a/packages/ui/src/lib/i18n/messages/he.ts
++++ b/packages/ui/src/lib/i18n/messages/he.ts
+@@ -2645,6 +2645,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'יישום MCP',
+   'chat.toolPart.mcpAppCall': 'היישום ביקש את הכלי {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'קריאת הכלי של היישום נכשלה: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'היישום עבר לעמוד אחר — הושבת',
+   'chat.toolPart.questionsAsked': 'שאלות שנשאלו: {count}',
+   'chat.toolPart.filesCount': 'קבצים: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} נוספות',
+diff --git a/packages/ui/src/lib/i18n/messages/ja.ts b/packages/ui/src/lib/i18n/messages/ja.ts
+index f0fa8c5..350d690 100644
+--- a/packages/ui/src/lib/i18n/messages/ja.ts
++++ b/packages/ui/src/lib/i18n/messages/ja.ts
+@@ -2699,6 +2699,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'MCP アプリ',
+   'chat.toolPart.mcpAppCall': 'アプリがツール {tool} を要求しました',
+   'chat.toolPart.mcpAppCallFailed': 'アプリのツール呼び出しに失敗しました: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'アプリが別のページに移動しました — 無効化済み',
+   'chat.toolPart.questionsAsked': '質問数: {count}',
+   'chat.toolPart.filesCount': 'ファイル数: {count}',
+   'chat.toolPart.moreToolCalls': '他 +{count} 件',
+diff --git a/packages/ui/src/lib/i18n/messages/ko.ts b/packages/ui/src/lib/i18n/messages/ko.ts
+index 8041e02..b1d56ad 100644
+--- a/packages/ui/src/lib/i18n/messages/ko.ts
++++ b/packages/ui/src/lib/i18n/messages/ko.ts
+@@ -2700,6 +2700,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'MCP 앱',
+   'chat.toolPart.mcpAppCall': '앱이 {tool} 도구를 요청했습니다',
+   'chat.toolPart.mcpAppCallFailed': '앱 도구 호출 실패: {tool}',
++  'chat.toolPart.mcpAppNavigated': '앱이 다른 페이지로 이동하여 비활성화되었습니다',
+   'chat.toolPart.questionsAsked': '질문 수: {count}',
+   'chat.toolPart.filesCount': '파일 수: {count}',
+   'chat.toolPart.moreToolCalls': '+{count}개 더',
+diff --git a/packages/ui/src/lib/i18n/messages/nl.ts b/packages/ui/src/lib/i18n/messages/nl.ts
+index ba31cef..08cfac3 100644
+--- a/packages/ui/src/lib/i18n/messages/nl.ts
++++ b/packages/ui/src/lib/i18n/messages/nl.ts
+@@ -2700,6 +2700,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'MCP-app',
+   'chat.toolPart.mcpAppCall': 'App heeft hulpmiddel {tool} aangevraagd',
+   'chat.toolPart.mcpAppCallFailed': 'Hulpmiddelaanroep van app mislukt: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'App heeft de pagina verlaten — uitgeschakeld',
+   'chat.toolPart.questionsAsked': 'Gestelde vragen: {count}',
+   'chat.toolPart.filesCount': 'Bestanden: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} meer',
+diff --git a/packages/ui/src/lib/i18n/messages/pl.ts b/packages/ui/src/lib/i18n/messages/pl.ts
+index 5bbee19..1fbe65c 100644
+--- a/packages/ui/src/lib/i18n/messages/pl.ts
++++ b/packages/ui/src/lib/i18n/messages/pl.ts
+@@ -1626,6 +1626,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'Aplikacja MCP',
+   'chat.toolPart.mcpAppCall': 'Aplikacja zażądała narzędzia {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'Wywołanie narzędzia aplikacji nie powiodło się: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'Aplikacja opuściła stronę — wyłączona',
+   'chat.toolPart.questionsAsked': 'Zadane pytania: {count}',
+   'chat.toolPart.filesCount': 'Pliki: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} więcej',
+diff --git a/packages/ui/src/lib/i18n/messages/pt-BR.ts b/packages/ui/src/lib/i18n/messages/pt-BR.ts
+index f290f17..fb9a41a 100644
+--- a/packages/ui/src/lib/i18n/messages/pt-BR.ts
++++ b/packages/ui/src/lib/i18n/messages/pt-BR.ts
+@@ -2654,6 +2654,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'Aplicativo MCP',
+   'chat.toolPart.mcpAppCall': 'O aplicativo solicitou a ferramenta {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'Falha na chamada do aplicativo: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'O aplicativo mudou de página — desativado',
+   "chat.toolPart.questionsAsked": 'Perguntas feitas: {count}',
+   "chat.toolPart.filesCount": 'Arquivos: {count}',
+   "chat.toolPart.moreToolCalls": '+{count} mais',
+diff --git a/packages/ui/src/lib/i18n/messages/tr.ts b/packages/ui/src/lib/i18n/messages/tr.ts
+index 103c74f..15b7d86 100644
+--- a/packages/ui/src/lib/i18n/messages/tr.ts
++++ b/packages/ui/src/lib/i18n/messages/tr.ts
+@@ -2529,6 +2529,7 @@ export const dict = {
+   'chat.toolPart.mcpAppTitle': 'MCP uygulaması',
+   'chat.toolPart.mcpAppCall': 'Uygulama {tool} aracını istedi',
+   'chat.toolPart.mcpAppCallFailed': 'Uygulamanın araç çağrısı başarısız: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'Uygulama sayfadan ayrıldı — devre dışı',
+   'chat.toolPart.questionsAsked': 'Sorulan sorular: {count}',
+   'chat.toolPart.filesCount': 'Dosyalar: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} daha',
+diff --git a/packages/ui/src/lib/i18n/messages/uk.ts b/packages/ui/src/lib/i18n/messages/uk.ts
+index b3d4147..47a8dce 100644
+--- a/packages/ui/src/lib/i18n/messages/uk.ts
++++ b/packages/ui/src/lib/i18n/messages/uk.ts
+@@ -2654,6 +2654,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'Застосунок MCP',
+   'chat.toolPart.mcpAppCall': 'Застосунок запросив інструмент {tool}',
+   'chat.toolPart.mcpAppCallFailed': 'Помилка виклику інструмента застосунку: {tool}',
++  'chat.toolPart.mcpAppNavigated': 'Застосунок перейшов на іншу сторінку — вимкнено',
+   "chat.toolPart.questionsAsked": 'Поставлено запитань: {count}',
+   "chat.toolPart.filesCount": 'Файлів: {count}',
+   "chat.toolPart.moreToolCalls": 'ще +{count}',
+diff --git a/packages/ui/src/lib/i18n/messages/zh-CN.ts b/packages/ui/src/lib/i18n/messages/zh-CN.ts
+index c481764..631bb08 100644
+--- a/packages/ui/src/lib/i18n/messages/zh-CN.ts
++++ b/packages/ui/src/lib/i18n/messages/zh-CN.ts
+@@ -2666,6 +2666,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'MCP 应用',
+   'chat.toolPart.mcpAppCall': '应用请求调用工具 {tool}',
+   'chat.toolPart.mcpAppCallFailed': '应用工具调用失败：{tool}',
++  'chat.toolPart.mcpAppNavigated': '应用已跳转到其他页面 — 已禁用',
+   'chat.toolPart.questionsAsked': '已提问：{count}',
+   'chat.toolPart.filesCount': '文件数：{count}',
+   'chat.toolPart.moreToolCalls': '还有 +{count} 个',
+diff --git a/packages/ui/src/lib/i18n/messages/zh-TW.ts b/packages/ui/src/lib/i18n/messages/zh-TW.ts
+index 4e48b0a..2f31e36 100644
+--- a/packages/ui/src/lib/i18n/messages/zh-TW.ts
++++ b/packages/ui/src/lib/i18n/messages/zh-TW.ts
+@@ -2675,6 +2675,7 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.mcpAppTitle': 'MCP 應用程式',
+   'chat.toolPart.mcpAppCall': '應用程式請求呼叫工具 {tool}',
+   'chat.toolPart.mcpAppCallFailed': '應用程式工具呼叫失敗：{tool}',
++  'chat.toolPart.mcpAppNavigated': '應用程式已前往其他頁面 — 已停用',
+   'chat.toolPart.questionsAsked': '已提問：{count}',
+   'chat.toolPart.filesCount': '檔案數：{count}',
+   'chat.toolPart.moreToolCalls': '還有 +{count} 個',
+diff --git a/packages/ui/src/lib/opencode/client.ts b/packages/ui/src/lib/opencode/client.ts
+index 4c7c820..cee7807 100644
+--- a/packages/ui/src/lib/opencode/client.ts
++++ b/packages/ui/src/lib/opencode/client.ts
+@@ -2047,7 +2047,7 @@ class OpencodeService {
+   }
+ 
+   /** SDK gap: @opencode/client 2.0.32 has no session-scoped MCP app call endpoint. */
+-  async callMcpTool(input: McpAppToolCall & { sessionID: string }, directory: string, signal?: AbortSignal): Promise<McpAppCallResult> {
++  async callMcpTool(input: McpAppToolCall & { sessionID: string; messageID?: string }, directory: string, signal?: AbortSignal): Promise<McpAppCallResult> {
+     if (!directory) throw new Error('MCP app requires the owning session directory')
+     const { sessionID, ...body } = input
+     const response = validateRuntimeResponse(await runtimeFetch(`${this.baseUrl}/session/${encodeURIComponent(sessionID)}/mcp/call`, {

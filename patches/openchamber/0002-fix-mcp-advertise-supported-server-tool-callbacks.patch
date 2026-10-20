@@ -1,0 +1,60 @@
+From a0299b9020ace798ab02d12db821d385dca83a8c Mon Sep 17 00:00:00 2001
+From: sofianbll <174883520+sofianbll@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:20:08 +0200
+Subject: [PATCH 2/3] fix(mcp): advertise supported server tool callbacks
+
+---
+ .../ui/src/components/chat/message/parts/DOCUMENTATION.md    | 5 +++--
+ packages/ui/src/lib/opencode/mcp-app.test.ts                 | 4 ++--
+ packages/ui/src/lib/opencode/mcp-app.ts                      | 2 +-
+ 3 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md b/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
+index e92db66..ba30df1 100644
+--- a/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
++++ b/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
+@@ -104,8 +104,9 @@ origins and passes an empty origin list to the extension policy. Browser-level
+ CSP enforcement is deferred to T6 Playwright and the final Electron pass.
+ 
+ The JSON-RPC adapter supports only `ui/initialize`,
+-`ui/notifications/initialized` and `tools/call`. Initialization advertises empty
+-host capabilities. Calls after initialization are restricted to the part's MCP
++`ui/notifications/initialized` and `tools/call`. Initialization advertises
++`serverTools: {}` so apps can enable their tool controls. It grants no browser
++permissions, resource access or external origins. Calls after initialization are restricted to the part's MCP
+ server, show a visible tool-request status, and use the owning `part.sessionID`
+ and session directory. Server-side permission requests still reach PermissionDock.
+ Missing ownership fails closed. Exact source-window identity, runtime identity,
+diff --git a/packages/ui/src/lib/opencode/mcp-app.test.ts b/packages/ui/src/lib/opencode/mcp-app.test.ts
+index 2dafb27..6e4de8b 100644
+--- a/packages/ui/src/lib/opencode/mcp-app.test.ts
++++ b/packages/ui/src/lib/opencode/mcp-app.test.ts
+@@ -1,13 +1,13 @@
+ import { expect, test } from 'bun:test';
+ import { createMcpAppBridge } from './mcp-app';
+ 
+-test('initialization grants no host capabilities', async () => {
++test('initialization advertises server tool calls without browser or resource grants', async () => {
+   const bridge = createMcpAppBridge({ server: 'demo', callTool: async () => ({ content: [] }) });
+   expect(await bridge.receive({ data: { jsonrpc: '2.0', id: 1, method: 'ui/initialize', params: {
+     protocolVersion: '2026-01-26', appCapabilities: {}, appInfo: { name: 'fixture', version: '1' },
+   } } })).toEqual({ jsonrpc: '2.0', id: 1, result: {
+     protocolVersion: '2026-01-26', hostInfo: { name: 'OpenChamber', version: '2.5.0' },
+-    hostCapabilities: {}, hostContext: { displayMode: 'inline', containerDimensions: { height: 320 } },
++    hostCapabilities: { serverTools: {} }, hostContext: { displayMode: 'inline', containerDimensions: { height: 320 } },
+   } });
+ });
+ 
+diff --git a/packages/ui/src/lib/opencode/mcp-app.ts b/packages/ui/src/lib/opencode/mcp-app.ts
+index 1a0cd42..6491201 100644
+--- a/packages/ui/src/lib/opencode/mcp-app.ts
++++ b/packages/ui/src/lib/opencode/mcp-app.ts
+@@ -43,7 +43,7 @@ export function createMcpAppBridge(options: { server: string; callTool: (call: M
+         initializing = true;
+         return { jsonrpc: '2.0', id: request.id, result: {
+           protocolVersion: '2026-01-26', hostInfo: { name: 'OpenChamber', version: '2.5.0' },
+-          hostCapabilities: {}, hostContext: { displayMode: 'inline', containerDimensions: { height: 320 } },
++          hostCapabilities: { serverTools: {} }, hostContext: { displayMode: 'inline', containerDimensions: { height: 320 } },
+         } };
+       }
+       if (request.method !== 'tools/call') return error(-32601, 'Method not found');

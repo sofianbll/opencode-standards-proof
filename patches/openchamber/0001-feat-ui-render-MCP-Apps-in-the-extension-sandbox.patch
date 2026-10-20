@@ -1,0 +1,726 @@
+From 080bbdf11c9a643c82124a8030e9874fdfc2867c Mon Sep 17 00:00:00 2001
+From: sofianbll <174883520+sofianbll@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:52:16 +0200
+Subject: [PATCH 1/3] feat(ui): render MCP Apps in the extension sandbox
+
+---
+ .../chat/message/parts/DOCUMENTATION.md       |  28 ++++
+ .../chat/message/parts/McpAppFrame.tsx        |  58 ++++++++
+ .../message/parts/ToolPart.mcp-app.test.tsx   | 124 ++++++++++++++++++
+ .../chat/message/parts/ToolPart.tsx           |   7 +-
+ packages/ui/src/lib/guests/frame-document.ts  |   9 ++
+ packages/ui/src/lib/guests/relay-document.ts  |   7 +-
+ packages/ui/src/lib/i18n/messages/ar.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/de.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/en.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/es.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/fr.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/he.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/ja.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/ko.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/nl.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/pl.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/pt-BR.ts    |   3 +
+ packages/ui/src/lib/i18n/messages/tr.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/uk.ts       |   3 +
+ packages/ui/src/lib/i18n/messages/zh-CN.ts    |   3 +
+ packages/ui/src/lib/i18n/messages/zh-TW.ts    |   3 +
+ packages/ui/src/lib/opencode/client.test.ts   |  12 ++
+ packages/ui/src/lib/opencode/client.ts        |  14 ++
+ packages/ui/src/lib/opencode/mcp-app.test.ts  |  39 ++++++
+ packages/ui/src/lib/opencode/mcp-app.ts       |  63 +++++++++
+ 25 files changed, 400 insertions(+), 6 deletions(-)
+ create mode 100644 packages/ui/src/components/chat/message/parts/McpAppFrame.tsx
+ create mode 100644 packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx
+ create mode 100644 packages/ui/src/lib/guests/frame-document.ts
+ create mode 100644 packages/ui/src/lib/opencode/mcp-app.test.ts
+ create mode 100644 packages/ui/src/lib/opencode/mcp-app.ts
+
+diff --git a/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md b/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
+index b55c090..e92db66 100644
+--- a/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
++++ b/packages/ui/src/components/chat/message/parts/DOCUMENTATION.md
+@@ -89,6 +89,34 @@ Use this doc when you ask an agent to change tool/header/description behavior.
+ 
+ ## Current important behavior
+ 
++### MCP Apps proof
++
++Web and Electron render `state.metadata.mcp.ui.html` at the start of the expanded
++tool result, including empty text and error results. VS Code, hosted mobile and
++Capacitor retain their existing text output. The tool row remains collapsible;
++folding it destroys the app's local state.
++
++`McpAppFrame` uses the extension `allow-scripts` opaque-origin frame and the
++shared `prependGuestFramePolicy` srcDoc path. The resource is not an installed
++extension and receives no extension grants. The metadata adapter parses
++`ui.meta.ui.csp.connectDomains` and `resourceDomains`; this proof approves no
++origins and passes an empty origin list to the extension policy. Browser-level
++CSP enforcement is deferred to T6 Playwright and the final Electron pass.
++
++The JSON-RPC adapter supports only `ui/initialize`,
++`ui/notifications/initialized` and `tools/call`. Initialization advertises empty
++host capabilities. Calls after initialization are restricted to the part's MCP
++server, show a visible tool-request status, and use the owning `part.sessionID`
++and session directory. Server-side permission requests still reach PermissionDock.
++Missing ownership fails closed. Exact source-window identity, runtime identity,
++effect cleanup and frame ownership gate requests and asynchronous replies.
++
++### Why the extension policy is reused
++
++This disposable proof reuses the existing extension isolation rules and CSP
++injection. The MCP Apps double-frame sandbox and additional host methods remain
++outside its scope.
++
+ ### Bidirectional prose
+ 
+ Shared chat CSS applies `unicode-bidi: plaintext` to prose blocks, including
+diff --git a/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx b/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx
+new file mode 100644
+index 0000000..2afdb2d
+--- /dev/null
++++ b/packages/ui/src/components/chat/message/parts/McpAppFrame.tsx
+@@ -0,0 +1,58 @@
++import React from 'react';
++import { createMcpAppBridge, type McpApp } from '@/lib/opencode/mcp-app';
++import { opencodeClient } from '@/lib/opencode/client';
++import { prependGuestFramePolicy } from '@/lib/guests/frame-document';
++import { getAllSyncSessionMap, getSyncSessionDirectory } from '@/sync/sync-refs';
++import { getRuntimeKey, subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
++import { useI18n } from '@/lib/i18n';
++
++export function McpAppFrame({ app, sessionID }: { app: McpApp; sessionID: string }) {
++  const { t } = useI18n();
++  const frameRef = React.useRef<HTMLIFrameElement>(null);
++  const [callStatus, setCallStatus] = React.useState<{ tool: string; failed: boolean } | null>(null);
++  const srcDoc = React.useMemo(() => {
++    const document = new DOMParser().parseFromString(app.ui.html, 'text/html');
++    // shortcut: declared CSP origins stay unapproved in this proof; add user grants before enabling them.
++    prependGuestFramePolicy(document);
++    return `<!doctype html>\n${document.documentElement.outerHTML}`;
++  }, [app.ui.html]);
++
++  React.useEffect(() => {
++    const frame = frameRef.current;
++    const runtimeKey = getRuntimeKey();
++    const controller = new AbortController();
++    let disposed = false;
++    const ownsFrame = () => !disposed && frame !== null && frameRef.current === frame && getRuntimeKey() === runtimeKey;
++    const bridge = createMcpAppBridge({ server: app.server, callTool: async (call) => {
++      if (!ownsFrame()) throw new Error('App is no longer active');
++      const directory = getAllSyncSessionMap().get(sessionID)?.directory ?? getSyncSessionDirectory(sessionID);
++      if (!directory) throw new Error('Owning session directory is unavailable');
++      setCallStatus({ tool: call.tool, failed: false });
++      try {
++        return await opencodeClient.callMcpTool({ sessionID, ...call }, directory, controller.signal);
++      } catch (error) {
++        if (ownsFrame()) setCallStatus({ tool: call.tool, failed: true });
++        throw error;
++      }
++    } });
++    const onMessage = (event: MessageEvent) => {
++      if (!ownsFrame() || event.source !== frame?.contentWindow) return;
++      void bridge.receive(event).then((reply) => {
++        // Opaque origins require '*'; exact source identity and ownership gate both directions.
++        if (reply && ownsFrame()) frame?.contentWindow?.postMessage(reply, '*');
++      });
++    };
++    const unsubscribe = subscribeRuntimeEndpointChanged(() => { disposed = true; controller.abort(); });
++    window.addEventListener('message', onMessage);
++    return () => { disposed = true; controller.abort(); unsubscribe(); window.removeEventListener('message', onMessage); };
++  }, [app.server, sessionID, srcDoc]);
++
++  return <div>
++    <iframe ref={frameRef} data-testid="mcp-app-frame" title={t('chat.toolPart.mcpAppTitle')}
++      sandbox="allow-scripts" srcDoc={srcDoc} className="w-full h-80 border-0" />
++    <div data-testid="mcp-app-status" role="status" className="typography-meta text-muted-foreground h-5 truncate"
++      title={callStatus ? t(callStatus.failed ? 'chat.toolPart.mcpAppCallFailed' : 'chat.toolPart.mcpAppCall', { tool: callStatus.tool }) : undefined}>
++      {callStatus ? t(callStatus.failed ? 'chat.toolPart.mcpAppCallFailed' : 'chat.toolPart.mcpAppCall', { tool: callStatus.tool }) : ''}
++    </div>
++  </div>;
++}
+diff --git a/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx b/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx
+new file mode 100644
+index 0000000..7052b77
+--- /dev/null
++++ b/packages/ui/src/components/chat/message/parts/ToolPart.mcp-app.test.tsx
+@@ -0,0 +1,124 @@
++import React, { act } from 'react';
++import { expect, test } from 'bun:test';
++import { plugin } from 'bun';
++import { pathToFileURL } from 'node:url';
++import { Window } from 'happy-dom';
++import { OpenCode } from '@opencode/client';
++import { SyncProvider } from '@/sync/sync-context';
++import { I18nProvider } from '@/lib/i18n';
++import { ThemeSystemContext, type ThemeContextValue } from '@/contexts/theme-system-context';
++import { getDefaultTheme } from '@/lib/theme/themes';
++import type { JsonValue, ToolPart as ToolPartData } from '@/lib/opencode/model';
++import { getSyncChildStores } from '@/sync/sync-refs';
++
++plugin({ name: 'mcp-app-worker-url', setup(build) {
++  build.onLoad({ filter: /markdown-shiki\.worker\.ts\?worker&url$/ }, ({ path }) => ({
++    contents: `export default ${JSON.stringify(pathToFileURL(path.split('?')[0]).href)};`, loader: 'js',
++  }));
++} });
++
++const part: ToolPartData = {
++  id: 'prt_app', sessionID: 'ses_owner', messageID: 'msg_app', type: 'tool', tool: 'mcp.demo.show', callID: 'call_app',
++  state: { status: 'completed', input: {}, output: '', time: { start: 1, end: 2 }, metadata: {
++    mcp: { server: 'demo', tool: 'show', ui: { resourceUri: 'ui://demo/app', mimeType: 'text/html;profile=mcp-app',
++      html: '<!doctype html><html><head><script>/* fixture */</script></head><body><button>Increment</button></body></html>',
++      meta: { ui: { csp: { connectDomains: ['https://api.example.com'], resourceDomains: ['https://cdn.example.com'] }, permissions: { camera: {} } } },
++    } },
++  } },
++};
++
++test('an app-only tool result renders an opaque frame with the extension CSP before all guest content', async () => {
++  const browser = new Window({ url: 'http://localhost' });
++  const descriptors = new Map<string, PropertyDescriptor | undefined>();
++  for (const [name, value] of Object.entries({
++    window: browser, document: browser.document, navigator: browser.navigator, localStorage: browser.localStorage,
++    Node: browser.Node, Text: browser.Text, NodeList: browser.NodeList, Element: browser.Element,
++    HTMLElement: browser.HTMLElement, SVGElement: browser.SVGElement, DOMParser: browser.DOMParser, customElements: browser.customElements,
++    ResizeObserver: browser.ResizeObserver, MutationObserver: browser.MutationObserver,
++    requestAnimationFrame: browser.requestAnimationFrame.bind(browser), cancelAnimationFrame: browser.cancelAnimationFrame.bind(browser),
++    getComputedStyle: browser.getComputedStyle.bind(browser), IS_REACT_ACT_ENVIRONMENT: true,
++  })) {
++    descriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
++    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
++  }
++  const { createRoot } = await import('react-dom/client');
++  const { default: ToolPart } = await import('./ToolPart');
++  const theme = getDefaultTheme(false);
++  const unexpected = (): never => { throw new Error('No theme changes expected'); };
++  const themeContext: ThemeContextValue = {
++    currentTheme: theme, availableThemes: [theme], setTheme: unexpected, customThemesLoading: false,
++    reloadCustomThemes: unexpected, importTheme: unexpected, deleteImportedTheme: unexpected, customThemeIds: [],
++    isSystemPreference: false, setSystemPreference: unexpected, themeMode: 'light', setThemeMode: unexpected,
++    lightThemeId: theme.metadata.id, darkThemeId: getDefaultTheme(true).metadata.id,
++    setLightThemePreference: unexpected, setDarkThemePreference: unexpected,
++  };
++  const sdk = OpenCode.make({ baseUrl: 'http://localhost', fetch: async () => Response.json([]) });
++  const host = document.createElement('div'); document.body.append(host);
++  const root = createRoot(host);
++  const previousFetch = globalThis.fetch;
++  const calls: { url: string; body: string; directory: string | null }[] = [];
++  const result = { content: [{ type: 'text', text: '2' }], structuredContent: { count: 2 } };
++  globalThis.fetch = async (input, init) => {
++    const url = input instanceof Request ? input.url : String(input);
++    if (url.endsWith('/mcp/call')) calls.push({ url, body: String(init?.body), directory: new Headers(init?.headers).get('x-opencode-directory') });
++    return Response.json(url.endsWith('/mcp/call') ? result : {});
++  };
++  try {
++    await act(async () => root.render(<SyncProvider sdk={sdk} directory=""><I18nProvider>
++      <ThemeSystemContext.Provider value={themeContext}>
++        <ToolPart part={part} isExpanded isMobile={false} onToggle={() => {}} />
++      </ThemeSystemContext.Provider>
++    </I18nProvider></SyncProvider>));
++    const frame = host.querySelector<HTMLIFrameElement>('[data-testid="mcp-app-frame"]');
++    expect(frame).not.toBeNull();
++    expect(frame?.getAttribute('sandbox')).toBe('allow-scripts');
++    expect(frame?.getAttribute('allow')).toBeNull();
++    const first = new DOMParser().parseFromString(frame?.srcdoc ?? '', 'text/html').head.firstElementChild;
++    expect(first?.getAttribute('http-equiv')).toBe('Content-Security-Policy');
++    expect(first?.getAttribute('content')).toContain("default-src 'none'");
++    expect(first?.getAttribute('content')).toContain("connect-src 'none'");
++    expect(first?.getAttribute('content')).not.toContain('example.com');
++    expect(host.textContent).not.toContain('resourceUri');
++    if (!frame?.contentWindow) throw new Error('Missing app window');
++    const replies: unknown[] = [];
++    frame.contentWindow.postMessage = (message) => { replies.push(message); };
++    const send = async (data: JsonValue, source = frame.contentWindow) => {
++      const event = new browser.Event('message');
++      Object.defineProperties(event, { source: { value: source }, data: { value: data } });
++      await act(async () => { browser.dispatchEvent(event); });
++    };
++    const store = getSyncChildStores().ensureChild('/repo/container', { bootstrap: false });
++    store.setState({ session: [{ id: part.sessionID, projectID: 'project', directory: '/repo/owner', title: 'Owner',
++      cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: 1, updated: 1 } }] });
++    await send({ jsonrpc: '2.0', id: 1, method: 'ui/initialize' });
++    await send({ jsonrpc: '2.0', method: 'ui/notifications/initialized' });
++    const call = { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'increment', arguments: { by: 1 } } };
++    const otherFrame = document.createElement('iframe'); document.body.append(otherFrame);
++    await send(call, otherFrame.contentWindow);
++    expect(calls).toHaveLength(0);
++    await send(call);
++    expect(calls).toEqual([{ url: '/api/session/ses_owner/mcp/call',
++      body: JSON.stringify({ server: 'demo', tool: 'increment', arguments: { by: 1 } }), directory: '%2Frepo%2Fowner' }]);
++    expect(replies.at(-1)).toEqual({ jsonrpc: '2.0', id: 2, result });
++    expect(host.querySelector('[data-testid="mcp-app-status"]')?.textContent).toContain('increment');
++    await send({ ...call, params: { ...call.params, server: 'other' } });
++    expect(replies.at(-1)).toMatchObject({ error: { code: -32602 } });
++    await send({ ...call, method: 'ui/open-link' });
++    expect(replies.at(-1)).toMatchObject({ error: { code: -32601 } });
++    expect(calls).toHaveLength(1);
++    let finish: (response: Response) => void = () => { throw new Error('No pending callback'); };
++    globalThis.fetch = async () => new Promise<Response>((resolve) => { finish = resolve; });
++    await send({ ...call, id: 3 });
++    const replyCount = replies.length;
++    await act(async () => root.unmount());
++    await act(async () => finish(Response.json(result)));
++    expect(replies).toHaveLength(replyCount);
++  } finally {
++    globalThis.fetch = previousFetch;
++    await act(async () => root.unmount());
++    await browser.happyDOM.abort();
++    for (const [name, descriptor] of descriptors) {
++      if (descriptor) Object.defineProperty(globalThis, name, descriptor); else Reflect.deleteProperty(globalThis, name);
++    }
++  }
++});
+diff --git a/packages/ui/src/components/chat/message/parts/ToolPart.tsx b/packages/ui/src/components/chat/message/parts/ToolPart.tsx
+index 29eef43..548368e 100644
+--- a/packages/ui/src/components/chat/message/parts/ToolPart.tsx
++++ b/packages/ui/src/components/chat/message/parts/ToolPart.tsx
+@@ -2,6 +2,8 @@
+ import React from 'react';
+ import { useMobileAppActions } from '@/apps/mobileAppContext';
+ import { RuntimeAPIContext } from '@/contexts/runtimeAPIContext';
++import { getMcpApp } from '@/lib/opencode/mcp-app';
++import { McpAppFrame } from './McpAppFrame';
+ import { cn } from '@/lib/utils';
+ import { SimpleMarkdownRenderer } from '../../MarkdownRenderer';
+ import { BlockLine } from './BlockLine';
+@@ -1094,6 +1096,8 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
+     const metadata = stateWithData.metadata;
+     const input = stateWithData.input;
+     const rawOutput = getToolOutput(part.tool, stateWithData.output, metadata?.output, state.status);
++    const isMobileSurface = useUIStore((s) => s.isMobile);
++    const mcpApp = !runtime?.runtime.isVSCode && !mobileActions && !isMobileSurface ? getMcpApp(metadata) : null;
+     const hasStringOutput = typeof rawOutput === 'string' && rawOutput.length > 0;
+     const rawOutputString = typeof rawOutput === 'string' ? rawOutput : '';
+     const isStreamingBash = isShellTool(part.tool) && state.status === 'running';
+@@ -1190,6 +1194,7 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
+     );
+ 
+     const renderResultContent = () => {
++        if (mcpApp) return <McpAppFrame key={`${part.sessionID}:${part.id}`} app={mcpApp} sessionID={part.sessionID} />;
+         const getEntryAbsolutePath = (entry: DiffPatchEntry) => toAbsoluteFilePath(currentDirectory, entry.filePath ?? entry.title);
+         const openEntryFile = (entry: DiffPatchEntry, event: React.MouseEvent<HTMLButtonElement>) => {
+             event.stopPropagation();
+@@ -1446,7 +1451,7 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
+     };
+ 
+     const hasVisibleOutput = outputString.trim().length > 0;
+-    const shouldRenderResult = (state.status === 'completed' && 'output' in state)
++    const shouldRenderResult = Boolean(mcpApp) || (state.status === 'completed' && 'output' in state)
+         || (isShellTool(part.tool) && hasVisibleOutput);
+ 
+     return (
+diff --git a/packages/ui/src/lib/guests/frame-document.ts b/packages/ui/src/lib/guests/frame-document.ts
+new file mode 100644
+index 0000000..4aee43d
+--- /dev/null
++++ b/packages/ui/src/lib/guests/frame-document.ts
+@@ -0,0 +1,9 @@
++import { guestFramePolicy } from '@openchamber/sdk';
++
++/** srcDoc has no response headers; install the extension network policy before guest content. */
++export function prependGuestFramePolicy(document: Document, origins: readonly string[] = []) {
++  const policy = document.createElement('meta');
++  policy.httpEquiv = 'Content-Security-Policy';
++  policy.content = guestFramePolicy(null, origins);
++  document.head.prepend(policy);
++}
+diff --git a/packages/ui/src/lib/guests/relay-document.ts b/packages/ui/src/lib/guests/relay-document.ts
+index eb3d376..46c3626 100644
+--- a/packages/ui/src/lib/guests/relay-document.ts
++++ b/packages/ui/src/lib/guests/relay-document.ts
+@@ -1,4 +1,4 @@
+-import { guestFramePolicy } from '@openchamber/sdk';
++import { prependGuestFramePolicy } from './frame-document';
+ 
+ const DOCUMENT_ORIGIN = 'https://extension.invalid';
+ const MAX_FILES = 500;
+@@ -149,10 +149,7 @@ export const loadRelayGuestDocument = async (
+     // for direct frames travels as the document's first element instead.
+     // Everything here is already inlined as data: URLs; only the origins the
+     // user approved may be reached.
+-    const policy = document.createElement('meta');
+-    policy.httpEquiv = 'Content-Security-Policy';
+-    policy.content = guestFramePolicy(null, origins);
+-    document.head.prepend(policy);
++    prependGuestFramePolicy(document, origins);
+     for (const node of document.querySelectorAll('script[src], link[href], img[src], source[src], video[src], audio[src], iframe[src], embed[src], object[data], image[href], image[xlink\\:href], use[href], use[xlink\\:href]')) {
+       for (const attribute of ['src', 'href', 'data', 'xlink:href']) {
+         const value = node.getAttribute(attribute);
+diff --git a/packages/ui/src/lib/i18n/messages/ar.ts b/packages/ui/src/lib/i18n/messages/ar.ts
+index f1c35e4..05e65b6 100644
+--- a/packages/ui/src/lib/i18n/messages/ar.ts
++++ b/packages/ui/src/lib/i18n/messages/ar.ts
+@@ -2642,6 +2642,9 @@ export const dict = {
+   'chat.toolPart.error': 'خطأ:',
+   'chat.toolPart.awaitingResponse': 'بانتظار الرد…',
+   'chat.toolPart.noOutputProduced': 'لا توجد مخرجات',
++  'chat.toolPart.mcpAppTitle': 'تطبيق MCP',
++  'chat.toolPart.mcpAppCall': 'طلب التطبيق الأداة {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'فشل استدعاء أداة التطبيق: {tool}',
+   'chat.toolPart.questionsAsked': 'الأسئلة المطروحة: {count}',
+   'chat.toolPart.filesCount': 'الملفات: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} أخرى',
+diff --git a/packages/ui/src/lib/i18n/messages/de.ts b/packages/ui/src/lib/i18n/messages/de.ts
+index b0a9ae6..81c4ad6 100644
+--- a/packages/ui/src/lib/i18n/messages/de.ts
++++ b/packages/ui/src/lib/i18n/messages/de.ts
+@@ -2413,6 +2413,9 @@ export const dict = {
+   'chat.toolPart.error': 'Fehler:',
+   'chat.toolPart.awaitingResponse': 'Warte auf Antwort...',
+   'chat.toolPart.noOutputProduced': 'Keine Ausgabe erzeugt',
++  'chat.toolPart.mcpAppTitle': 'MCP-App',
++  'chat.toolPart.mcpAppCall': 'App hat Werkzeug {tool} angefordert',
++  'chat.toolPart.mcpAppCallFailed': 'Werkzeugaufruf der App fehlgeschlagen: {tool}',
+   'chat.toolPart.questionsAsked': 'Gestellte Fragen: {count}',
+   'chat.toolPart.filesCount': 'Dateien: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} weitere',
+diff --git a/packages/ui/src/lib/i18n/messages/en.ts b/packages/ui/src/lib/i18n/messages/en.ts
+index e73b535..2c8c0da 100644
+--- a/packages/ui/src/lib/i18n/messages/en.ts
++++ b/packages/ui/src/lib/i18n/messages/en.ts
+@@ -2697,6 +2697,9 @@ export const dict = {
+   'chat.toolPart.error': 'Error:',
+   'chat.toolPart.awaitingResponse': 'Awaiting response...',
+   'chat.toolPart.noOutputProduced': 'No output produced',
++  'chat.toolPart.mcpAppTitle': 'MCP app',
++  'chat.toolPart.mcpAppCall': 'App requested tool {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'App tool call failed: {tool}',
+   'chat.toolPart.questionsAsked': 'Questions asked: {count}',
+   'chat.toolPart.filesCount': 'Files: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} more',
+diff --git a/packages/ui/src/lib/i18n/messages/es.ts b/packages/ui/src/lib/i18n/messages/es.ts
+index f0b0545..4ea90f9 100644
+--- a/packages/ui/src/lib/i18n/messages/es.ts
++++ b/packages/ui/src/lib/i18n/messages/es.ts
+@@ -2651,6 +2651,9 @@ export const dict: Record<I18nKey, string> = {
+   "chat.toolPart.error": "Error:",
+   "chat.toolPart.awaitingResponse": "Esperando respuesta...",
+   "chat.toolPart.noOutputProduced": "No se produjo ninguna salida",
++  'chat.toolPart.mcpAppTitle': 'Aplicación MCP',
++  'chat.toolPart.mcpAppCall': 'La aplicación solicitó la herramienta {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'Falló la llamada de la aplicación: {tool}',
+   "chat.toolPart.questionsAsked": 'Preguntas realizadas: {count}',
+   "chat.toolPart.filesCount": 'Archivos: {count}',
+   "chat.toolPart.moreToolCalls": '+{count} más',
+diff --git a/packages/ui/src/lib/i18n/messages/fr.ts b/packages/ui/src/lib/i18n/messages/fr.ts
+index 02e957a..789917d 100644
+--- a/packages/ui/src/lib/i18n/messages/fr.ts
++++ b/packages/ui/src/lib/i18n/messages/fr.ts
+@@ -2383,6 +2383,9 @@ export const dict = {
+   'chat.toolPart.error': 'Erreur:',
+   'chat.toolPart.awaitingResponse': 'En attente de réponse...',
+   'chat.toolPart.noOutputProduced': 'Aucune sortie produite',
++  'chat.toolPart.mcpAppTitle': 'Application MCP',
++  'chat.toolPart.mcpAppCall': "L'application a demandé l'outil {tool}",
++  'chat.toolPart.mcpAppCallFailed': "Échec de l'appel de l'outil : {tool}",
+   'chat.toolPart.questionsAsked': 'Questions posées : {count}',
+   'chat.toolPart.filesCount': 'Fichiers : {count}',
+   'chat.toolPart.moreToolCalls': '+{count} de plus',
+diff --git a/packages/ui/src/lib/i18n/messages/he.ts b/packages/ui/src/lib/i18n/messages/he.ts
+index 12e2fc6..d463fa5 100644
+--- a/packages/ui/src/lib/i18n/messages/he.ts
++++ b/packages/ui/src/lib/i18n/messages/he.ts
+@@ -2642,6 +2642,9 @@ export const dict = {
+   'chat.toolPart.error': 'שגיאה:',
+   'chat.toolPart.awaitingResponse': 'ממתין לתגובה…',
+   'chat.toolPart.noOutputProduced': 'לא נוצר פלט',
++  'chat.toolPart.mcpAppTitle': 'יישום MCP',
++  'chat.toolPart.mcpAppCall': 'היישום ביקש את הכלי {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'קריאת הכלי של היישום נכשלה: {tool}',
+   'chat.toolPart.questionsAsked': 'שאלות שנשאלו: {count}',
+   'chat.toolPart.filesCount': 'קבצים: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} נוספות',
+diff --git a/packages/ui/src/lib/i18n/messages/ja.ts b/packages/ui/src/lib/i18n/messages/ja.ts
+index 7debbcb..f0fa8c5 100644
+--- a/packages/ui/src/lib/i18n/messages/ja.ts
++++ b/packages/ui/src/lib/i18n/messages/ja.ts
+@@ -2696,6 +2696,9 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.error': 'エラー:',
+   'chat.toolPart.awaitingResponse': '応答を待機中...',
+   'chat.toolPart.noOutputProduced': '出力は生成されませんでした',
++  'chat.toolPart.mcpAppTitle': 'MCP アプリ',
++  'chat.toolPart.mcpAppCall': 'アプリがツール {tool} を要求しました',
++  'chat.toolPart.mcpAppCallFailed': 'アプリのツール呼び出しに失敗しました: {tool}',
+   'chat.toolPart.questionsAsked': '質問数: {count}',
+   'chat.toolPart.filesCount': 'ファイル数: {count}',
+   'chat.toolPart.moreToolCalls': '他 +{count} 件',
+diff --git a/packages/ui/src/lib/i18n/messages/ko.ts b/packages/ui/src/lib/i18n/messages/ko.ts
+index ad2e1e6..8041e02 100644
+--- a/packages/ui/src/lib/i18n/messages/ko.ts
++++ b/packages/ui/src/lib/i18n/messages/ko.ts
+@@ -2697,6 +2697,9 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.error': '오류:',
+   'chat.toolPart.awaitingResponse': '응답 대기 중…',
+   'chat.toolPart.noOutputProduced': '출력 없음',
++  'chat.toolPart.mcpAppTitle': 'MCP 앱',
++  'chat.toolPart.mcpAppCall': '앱이 {tool} 도구를 요청했습니다',
++  'chat.toolPart.mcpAppCallFailed': '앱 도구 호출 실패: {tool}',
+   'chat.toolPart.questionsAsked': '질문 수: {count}',
+   'chat.toolPart.filesCount': '파일 수: {count}',
+   'chat.toolPart.moreToolCalls': '+{count}개 더',
+diff --git a/packages/ui/src/lib/i18n/messages/nl.ts b/packages/ui/src/lib/i18n/messages/nl.ts
+index 9e2116d..ba31cef 100644
+--- a/packages/ui/src/lib/i18n/messages/nl.ts
++++ b/packages/ui/src/lib/i18n/messages/nl.ts
+@@ -2697,6 +2697,9 @@ export const dict = {
+   'chat.toolPart.error': 'Fout:',
+   'chat.toolPart.awaitingResponse': 'Wachten op antwoord...',
+   'chat.toolPart.noOutputProduced': 'Geen uitvoer',
++  'chat.toolPart.mcpAppTitle': 'MCP-app',
++  'chat.toolPart.mcpAppCall': 'App heeft hulpmiddel {tool} aangevraagd',
++  'chat.toolPart.mcpAppCallFailed': 'Hulpmiddelaanroep van app mislukt: {tool}',
+   'chat.toolPart.questionsAsked': 'Gestelde vragen: {count}',
+   'chat.toolPart.filesCount': 'Bestanden: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} meer',
+diff --git a/packages/ui/src/lib/i18n/messages/pl.ts b/packages/ui/src/lib/i18n/messages/pl.ts
+index 1471aaf..5bbee19 100644
+--- a/packages/ui/src/lib/i18n/messages/pl.ts
++++ b/packages/ui/src/lib/i18n/messages/pl.ts
+@@ -1623,6 +1623,9 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.moreErrors': '+{count} kolejnych błędów',
+   'chat.toolPart.moreRows': '+{count} kolejnych wierszy',
+   'chat.toolPart.noOutputProduced': 'Brak wygenerowanego wyniku',
++  'chat.toolPart.mcpAppTitle': 'Aplikacja MCP',
++  'chat.toolPart.mcpAppCall': 'Aplikacja zażądała narzędzia {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'Wywołanie narzędzia aplikacji nie powiodło się: {tool}',
+   'chat.toolPart.questionsAsked': 'Zadane pytania: {count}',
+   'chat.toolPart.filesCount': 'Pliki: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} więcej',
+diff --git a/packages/ui/src/lib/i18n/messages/pt-BR.ts b/packages/ui/src/lib/i18n/messages/pt-BR.ts
+index c991e0c..f290f17 100644
+--- a/packages/ui/src/lib/i18n/messages/pt-BR.ts
++++ b/packages/ui/src/lib/i18n/messages/pt-BR.ts
+@@ -2651,6 +2651,9 @@ export const dict: Record<I18nKey, string> = {
+   "chat.toolPart.error": "Erro:",
+   "chat.toolPart.awaitingResponse": "Aguardando resposta...",
+   "chat.toolPart.noOutputProduced": "Nenhuma saída produzida",
++  'chat.toolPart.mcpAppTitle': 'Aplicativo MCP',
++  'chat.toolPart.mcpAppCall': 'O aplicativo solicitou a ferramenta {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'Falha na chamada do aplicativo: {tool}',
+   "chat.toolPart.questionsAsked": 'Perguntas feitas: {count}',
+   "chat.toolPart.filesCount": 'Arquivos: {count}',
+   "chat.toolPart.moreToolCalls": '+{count} mais',
+diff --git a/packages/ui/src/lib/i18n/messages/tr.ts b/packages/ui/src/lib/i18n/messages/tr.ts
+index 0adccaa..103c74f 100644
+--- a/packages/ui/src/lib/i18n/messages/tr.ts
++++ b/packages/ui/src/lib/i18n/messages/tr.ts
+@@ -2526,6 +2526,9 @@ export const dict = {
+   'chat.toolPart.error': 'Hata:',
+   'chat.toolPart.awaitingResponse': 'Yanıt bekleniyor...',
+   'chat.toolPart.noOutputProduced': 'Çıktı üretilmedi',
++  'chat.toolPart.mcpAppTitle': 'MCP uygulaması',
++  'chat.toolPart.mcpAppCall': 'Uygulama {tool} aracını istedi',
++  'chat.toolPart.mcpAppCallFailed': 'Uygulamanın araç çağrısı başarısız: {tool}',
+   'chat.toolPart.questionsAsked': 'Sorulan sorular: {count}',
+   'chat.toolPart.filesCount': 'Dosyalar: {count}',
+   'chat.toolPart.moreToolCalls': '+{count} daha',
+diff --git a/packages/ui/src/lib/i18n/messages/uk.ts b/packages/ui/src/lib/i18n/messages/uk.ts
+index 9f5223c..b3d4147 100644
+--- a/packages/ui/src/lib/i18n/messages/uk.ts
++++ b/packages/ui/src/lib/i18n/messages/uk.ts
+@@ -2651,6 +2651,9 @@ export const dict: Record<I18nKey, string> = {
+   "chat.toolPart.error": "Помилка:",
+   "chat.toolPart.awaitingResponse": "Очікування відповіді...",
+   "chat.toolPart.noOutputProduced": "Вивід відсутній",
++  'chat.toolPart.mcpAppTitle': 'Застосунок MCP',
++  'chat.toolPart.mcpAppCall': 'Застосунок запросив інструмент {tool}',
++  'chat.toolPart.mcpAppCallFailed': 'Помилка виклику інструмента застосунку: {tool}',
+   "chat.toolPart.questionsAsked": 'Поставлено запитань: {count}',
+   "chat.toolPart.filesCount": 'Файлів: {count}',
+   "chat.toolPart.moreToolCalls": 'ще +{count}',
+diff --git a/packages/ui/src/lib/i18n/messages/zh-CN.ts b/packages/ui/src/lib/i18n/messages/zh-CN.ts
+index 0959960..c481764 100644
+--- a/packages/ui/src/lib/i18n/messages/zh-CN.ts
++++ b/packages/ui/src/lib/i18n/messages/zh-CN.ts
+@@ -2663,6 +2663,9 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.error': '错误：',
+   'chat.toolPart.awaitingResponse': '等待响应...',
+   'chat.toolPart.noOutputProduced': '未产生输出',
++  'chat.toolPart.mcpAppTitle': 'MCP 应用',
++  'chat.toolPart.mcpAppCall': '应用请求调用工具 {tool}',
++  'chat.toolPart.mcpAppCallFailed': '应用工具调用失败：{tool}',
+   'chat.toolPart.questionsAsked': '已提问：{count}',
+   'chat.toolPart.filesCount': '文件数：{count}',
+   'chat.toolPart.moreToolCalls': '还有 +{count} 个',
+diff --git a/packages/ui/src/lib/i18n/messages/zh-TW.ts b/packages/ui/src/lib/i18n/messages/zh-TW.ts
+index 5bff32b..4e48b0a 100644
+--- a/packages/ui/src/lib/i18n/messages/zh-TW.ts
++++ b/packages/ui/src/lib/i18n/messages/zh-TW.ts
+@@ -2672,6 +2672,9 @@ export const dict: Record<I18nKey, string> = {
+   'chat.toolPart.error': '錯誤：',
+   'chat.toolPart.awaitingResponse': '等待回應...',
+   'chat.toolPart.noOutputProduced': '未產生輸出',
++  'chat.toolPart.mcpAppTitle': 'MCP 應用程式',
++  'chat.toolPart.mcpAppCall': '應用程式請求呼叫工具 {tool}',
++  'chat.toolPart.mcpAppCallFailed': '應用程式工具呼叫失敗：{tool}',
+   'chat.toolPart.questionsAsked': '已提問：{count}',
+   'chat.toolPart.filesCount': '檔案數：{count}',
+   'chat.toolPart.moreToolCalls': '還有 +{count} 個',
+diff --git a/packages/ui/src/lib/opencode/client.test.ts b/packages/ui/src/lib/opencode/client.test.ts
+index 5b25900..58c19ca 100644
+--- a/packages/ui/src/lib/opencode/client.test.ts
++++ b/packages/ui/src/lib/opencode/client.test.ts
+@@ -105,6 +105,18 @@ beforeEach(() => {
+   opencodeClient.clearConfigCache()
+ })
+ 
++test('MCP app callbacks preserve the owning session, directory and full result', async () => {
++  const result = { content: [{ type: 'text', text: '2' }], structuredContent: { count: 2 }, _meta: { proof: true } };
++  responses.push(json(result));
++  expect(await opencodeClient.callMcpTool({ sessionID: 'ses_owner', server: 'demo', tool: 'increment', arguments: { by: 1 } }, '/repo/owner')).toEqual(result);
++  expect(requests[0].url.pathname).toBe('/api/session/ses_owner/mcp/call');
++  expect(requests[0].method).toBe('POST');
++  expect(requests[0].headers.get('x-opencode-directory')).toBe('%2Frepo%2Fowner');
++  expect(requests[0].body).toEqual({ server: 'demo', tool: 'increment', arguments: { by: 1 } });
++  responses.push(json({ message: 'Denied' }, 403));
++  await expect(opencodeClient.callMcpTool({ sessionID: 'ses_owner', server: 'demo', tool: 'increment', arguments: {} }, '/repo/owner')).rejects.toThrow();
++});
++
+ describe('runtime routing responses', () => {
+   const routingFailureSchema = z.object({ message: z.string(), status: z.number() })
+   const html = () => new Response('<!doctype html><title>OpenChamber</title>', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+diff --git a/packages/ui/src/lib/opencode/client.ts b/packages/ui/src/lib/opencode/client.ts
+index 61eccd8..4c7c820 100644
+--- a/packages/ui/src/lib/opencode/client.ts
++++ b/packages/ui/src/lib/opencode/client.ts
+@@ -30,6 +30,7 @@ import { FilesystemError, parseFilesystemErrorReason } from "@/lib/api/files-err
+ import type { ContextPartMetadata } from "@/lib/messages/contextParts"
+ import { getRuntimeUrlResolver } from "@/lib/runtime-url"
+ import { runtimeFetch } from "@/lib/runtime-fetch"
++import { mcpAppCallResultSchema, type McpAppToolCall, type McpAppCallResult } from './mcp-app'
+ import { isRelayModeActive } from "@/lib/relay/runtime-tunnel"
+ import { isSpaceDirectory, spaceIdOfDirectory } from "@/lib/spaces/space-route"
+ import { getSpaceMark, spaceMarkSchema, type SpaceMark } from "@/lib/spaces/spaces-store"
+@@ -2045,6 +2046,19 @@ class OpencodeService {
+     return call("mcp.list", () => this.clientFor(directory).mcp.list().then((r) => r.data))
+   }
+ 
++  /** SDK gap: @opencode/client 2.0.32 has no session-scoped MCP app call endpoint. */
++  async callMcpTool(input: McpAppToolCall & { sessionID: string }, directory: string, signal?: AbortSignal): Promise<McpAppCallResult> {
++    if (!directory) throw new Error('MCP app requires the owning session directory')
++    const { sessionID, ...body } = input
++    const response = validateRuntimeResponse(await runtimeFetch(`${this.baseUrl}/session/${encodeURIComponent(sessionID)}/mcp/call`, {
++      method: 'POST', signal,
++      headers: { 'Content-Type': 'application/json', [OPENCODE_DIRECTORY_HEADER]: encodeURIComponent(directory) },
++      body: JSON.stringify(body),
++    }))
++    if (!response.ok) throw new Error(`MCP tool call failed (${response.status})`)
++    return mcpAppCallResultSchema.parse(await response.json())
++  }
++
+   async connectMcpServer(server: string, directory?: string | null): Promise<void> {
+     await call("mcp.connect", () => this.clientFor(directory).mcp.connect({ server }))
+   }
+diff --git a/packages/ui/src/lib/opencode/mcp-app.test.ts b/packages/ui/src/lib/opencode/mcp-app.test.ts
+new file mode 100644
+index 0000000..2dafb27
+--- /dev/null
++++ b/packages/ui/src/lib/opencode/mcp-app.test.ts
+@@ -0,0 +1,39 @@
++import { expect, test } from 'bun:test';
++import { createMcpAppBridge } from './mcp-app';
++
++test('initialization grants no host capabilities', async () => {
++  const bridge = createMcpAppBridge({ server: 'demo', callTool: async () => ({ content: [] }) });
++  expect(await bridge.receive({ data: { jsonrpc: '2.0', id: 1, method: 'ui/initialize', params: {
++    protocolVersion: '2026-01-26', appCapabilities: {}, appInfo: { name: 'fixture', version: '1' },
++  } } })).toEqual({ jsonrpc: '2.0', id: 1, result: {
++    protocolVersion: '2026-01-26', hostInfo: { name: 'OpenChamber', version: '2.5.0' },
++    hostCapabilities: {}, hostContext: { displayMode: 'inline', containerDimensions: { height: 320 } },
++  } });
++});
++
++test('malformed messages and unsolicited notifications have no host effects', async () => {
++  let calls = 0;
++  const bridge = createMcpAppBridge({ server: 'demo', callTool: async () => { calls += 1; return { content: [] }; } });
++  for (const data of [null, [], 'tools/call', { jsonrpc: '1.0', id: 3, method: 'tools/call' },
++    { jsonrpc: '2.0', method: 'tools/call', params: { name: 'increment' } }]) {
++    expect(await bridge.receive({ data })).toBeNull();
++  }
++  expect(calls).toBe(0);
++});
++
++test('only initialized apps can call tools, always on their own server', async () => {
++  const calls: unknown[] = [];
++  const result = { content: [{ type: 'text', text: '2' }], structuredContent: { count: 2 }, _meta: { test: true } };
++  const bridge = createMcpAppBridge({ server: 'demo', callTool: async (call) => { calls.push(call); return result; } });
++  const request = { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'increment', arguments: { by: 1 } } };
++  expect(await bridge.receive({ data: request })).toMatchObject({ id: 2, error: { code: -32000 } });
++  await bridge.receive({ data: { jsonrpc: '2.0', id: 1, method: 'ui/initialize' } });
++  expect(await bridge.receive({ data: { jsonrpc: '2.0', method: 'ui/notifications/initialized' } })).toBeNull();
++  expect(await bridge.receive({ data: request })).toEqual({ jsonrpc: '2.0', id: 2, result });
++  expect(calls).toEqual([{ server: 'demo', tool: 'increment', arguments: { by: 1 } }]);
++  expect(await bridge.receive({ data: { ...request, params: { ...request.params, server: 'other' } } })).toMatchObject({ error: { code: -32602 } });
++  for (const method of ['ui/open-link', 'ui/message', 'resources/read', 'ping']) {
++    expect(await bridge.receive({ data: { ...request, method } })).toMatchObject({ error: { code: -32601 } });
++  }
++  expect(calls).toHaveLength(1);
++});
+diff --git a/packages/ui/src/lib/opencode/mcp-app.ts b/packages/ui/src/lib/opencode/mcp-app.ts
+new file mode 100644
+index 0000000..1a0cd42
+--- /dev/null
++++ b/packages/ui/src/lib/opencode/mcp-app.ts
+@@ -0,0 +1,63 @@
++import { z } from 'zod';
++import type { JsonValue, Metadata } from './model';
++
++const appSchema = z.object({ server: z.string().min(1), ui: z.object({
++  html: z.string(), meta: z.object({ ui: z.object({ csp: z.object({
++    connectDomains: z.array(z.string()).optional(), resourceDomains: z.array(z.string()).optional(),
++  }).optional() }).optional() }).optional(),
++}) });
++export function getMcpApp(metadata: Metadata | undefined) {
++  const parsed = z.object({ mcp: appSchema }).safeParse(metadata);
++  return parsed.success ? parsed.data.mcp : null;
++}
++export type McpApp = z.infer<typeof appSchema>;
++
++const requestSchema = z.object({
++  jsonrpc: z.literal('2.0'), id: z.union([z.string(), z.number()]).optional(),
++  method: z.string(), params: z.json().optional(),
++});
++const callParamsSchema = z.object({
++  name: z.string().min(1), arguments: z.record(z.string(), z.json()).optional(), server: z.string().optional(),
++}).strict();
++export const mcpAppCallResultSchema = z.object({
++  content: z.array(z.json()), structuredContent: z.record(z.string(), z.json()).optional(),
++  isError: z.boolean().optional(), _meta: z.record(z.string(), z.json()).optional(),
++}).catchall(z.json());
++export type McpAppCallResult = z.infer<typeof mcpAppCallResultSchema>;
++export type McpAppToolCall = { server: string; tool: string; arguments: Record<string, JsonValue> };
++
++export function createMcpAppBridge(options: { server: string; callTool: (call: McpAppToolCall) => Promise<McpAppCallResult> }) {
++  let initialized = false;
++  let initializing = false;
++  return {
++    async receive(event: Pick<MessageEvent, 'data'>) {
++      const parsed = requestSchema.safeParse(event.data);
++      if (!parsed.success) return null;
++      const request = parsed.data;
++      if (request.id === undefined) {
++        if (request.method === 'ui/notifications/initialized' && initializing) initialized = true;
++        return null;
++      }
++      const error = (code: number, message: string) => ({ jsonrpc: '2.0', id: request.id, error: { code, message } });
++      if (request.method === 'ui/initialize') {
++        initializing = true;
++        return { jsonrpc: '2.0', id: request.id, result: {
++          protocolVersion: '2026-01-26', hostInfo: { name: 'OpenChamber', version: '2.5.0' },
++          hostCapabilities: {}, hostContext: { displayMode: 'inline', containerDimensions: { height: 320 } },
++        } };
++      }
++      if (request.method !== 'tools/call') return error(-32601, 'Method not found');
++      if (!initialized) return error(-32000, 'App is not initialized');
++      const params = callParamsSchema.safeParse(request.params);
++      if (!params.success || (params.data.server !== undefined && params.data.server !== options.server)) {
++        return error(-32602, 'Invalid tool call or server');
++      }
++      try {
++        const result = await options.callTool({ server: options.server, tool: params.data.name, arguments: params.data.arguments ?? {} });
++        return { jsonrpc: '2.0', id: request.id, result };
++      } catch {
++        return error(-32000, 'Tool call failed or permission denied');
++      }
++    },
++  };
++}

@@ -1,0 +1,48 @@
+name: MCP Apps and Agent Plugins proof
+on:
+  push:
+    branches: [main, t14-e2e]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.build/browsers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.3'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('e2e/bases.env', 'patches/**/*.patch') }}
+          restore-keys: bun-${{ runner.os }}-
+      - name: Apply pinned patches, install and build
+        run: bash e2e/prepare.sh
+      - run: npx playwright install --with-deps chromium
+      - run: node --test e2e/mock-llm.test.mjs e2e/agent-plugin.test.mjs
+      - name: Real Agent Plugins package, model tool, removal and invalid manifest
+        run: bash e2e/run.sh --plugins
+      - name: Real browser, model tool and MCP callback
+        run: bash e2e/run.sh
+      - name: Negative control — blocked callback must fail the same scenario
+        if: success()
+        run: bash e2e/run.sh --negative
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcp-apps-browser-evidence
+          path: |
+            test-results/
+            negative-results/
+            playwright-report/
+          retention-days: 14
